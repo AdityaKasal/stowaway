@@ -459,7 +459,8 @@ Routing with bonus 1.0 saves 39% at 0.029, so it is the better way to trade a li
 wait time dropped in step: 216 s -> 92 s for the 2,048 tokens. `--fast` uses bonus 1.0.
 
 Keeping the model's own top-ranked pick regardless (`MOE_CACHE_PROTECT=1`) changed almost nothing (bonus 1.0:
-KLD 0.028 vs 0.029, same reads). The top pick is rarely the one that gets switched, so the plain bonus stays.
+KLD 0.028 vs 0.029, same reads), and keeping the top two (`MOE_CACHE_PROTECT=2`) didn't either (0.031). The top
+picks are rarely the ones that get switched, so the plain bonus stays.
 
 Prior art note: colibri (github.com/JustVugg/colibri) deliberately never changes routing. Here it is opt-in and the
 app says the answers will differ.
@@ -482,6 +483,31 @@ disk, and the packed copy is 22 GB, so the model uses ~25 GB instead of ~47. A f
 byte-identical answers before and after slimming, with a 6 GB cache and with a 0.3 GB cache (12 experts overflowed
 and were read through the packed mapping). The app slims models it downloaded itself automatically; a model file
 the user brought is only slimmed with `--slim`.
+
+## 18. The 122B at Q8 on the 8 GB machine (2026-09-25)
+
+Qwen3.5-122B-A10B Q8_0 (129.9 GB, `unsloth/Qwen3.5-122B-A10B-GGUF`), packed with `--slim`: 123.2 GB of experts
+packed and verified layer by layer in 275 s, and 123.2 GB freed in the original files (GGUFs 122 GB -> 7 GB on disk),
+so the model uses 122 GB instead of 245. Then the 8 GB / 4 CPU / no-swap VM with the disk capped at 3 GB/s, 96 tokens
+per run (`vm/q122-test.sh`; tok/s):
+
+| Prompt | Plain | Helper 0.8B | `--fast` | Helper + `--fast` |
+|---|---|---|---|---|
+| Sky is blue | 0.6 | 0.6 | 0.6 | 0.6 |
+| Python function | 0.5 | 0.8 | 0.6 | 0.8 |
+| Mystery story | 0.6 | 0.5 | 0.6 | 0.5 |
+
+- The 122B at Q8 runs on 8 GB at ~0.6 tok/s, versus ~0.7 at Q5 (section 12): about 15% slower for 1.45x bigger
+  experts, because the streamed always-needed weights (the same 5.84 GB at Q5 and Q8) dominate. Lowest free memory
+  1.6 GB, no OOM kills.
+- `--fast` does nothing here. The 8 GB plan leaves the 122B a 0.5 GB expert cache (~50 experts of 10 MB), so there is
+  rarely a cached alternative to switch to. It pays off when the cache holds a real share of the experts (the 35B:
+  ~1,000).
+- The helper model gains 0-45% at Q8 versus up to 2x at Q5. Verifying k guessed tokens needs the union of their experts,
+  and at Q8 each extra expert costs 1.45x more to read, eating into what one shared pass over the dense weights saves.
+- At 3 GB/s this is near the floor for this approach: ~5.4 GB read per token is ~1.8 s. What moves it: a faster SSD
+  (~1.3 tok/s at 7 GB/s), 16 GB of RAM (always-needed weights stay in memory and the expert cache grows), or reading
+  fewer bytes per token.
 
 ## What didn't work, and why
 
