@@ -1,8 +1,8 @@
-# moe
+# stowaway
 
 Run big AI models on an ordinary computer: no graphics card, 8 GB of RAM.
 
-`moe` runs **Qwen3.5-122B-A10B at Q5** (a 91.5 GB model) on a machine with 8 GB of RAM and no GPU, and
+stowaway runs **Qwen3.5-122B-A10B at Q5** (a 91.5 GB model) on a machine with 8 GB of RAM and no GPU, and
 **Qwen3.5-35B-A3B at Q5** (26 GB) at conversation speed on the same machine. Normally both need a big GPU or a lot
 of RAM. The quality is unchanged: it's the full Q5 model, not a smaller or more compressed one.
 
