@@ -23,6 +23,8 @@ in your browser.
 |---|---|
 | Qwen3.5-35B-A3B Q5 (26 GB download) | ~5-8 words per second (~2 on a 4 GB machine) |
 | Qwen3.5-122B-A10B Q5 (92 GB download) | ~1 word per second (~1.5-2 with 16 GB of RAM and `--fast`) |
+| OpenAI gpt-oss-20b (12 GB download) | ~7-9 words per second (~2.4 on a 4 GB machine) |
+| OpenAI gpt-oss-120b (63 GB download) | ~2.3 words per second: the best big model for 8 GB |
 
 You need an SSD and about the model's size in free disk space, plus 10%. From a terminal:
 

@@ -589,6 +589,47 @@ The plan keeps the always-needed weights in RAM and gives the experts a 7.3 GB c
 Twice the 8 GB speed (0.6), and `--fast` adds ~40%: its answering part switched 18-21% of picks to experts already in
 the 7.3 GB cache, which is ~1.9 tokens' worth of Q8 experts, above the 1x threshold (section 16). No OOM kills.
 
+## 22. OpenAI gpt-oss-20b and gpt-oss-120b (2026-09-25)
+
+Both are MoE models in their native MXFP4 format (`ggml-org/gpt-oss-*-GGUF`), and both are light per token: the 120b
+has 60.9 GB of experts but only 1.7 GB of always-needed weights (the Qwen 122B has 5.8), 4 of 128 experts per token.
+Support needed three fixes: their experts carry small per-expert bias tensors (`*_exps.bias`), which must not be
+packed or freed (only `*_exps.weight` is), their router ranks experts by raw logits (softmax after top-k), so a bonus
+is added as ln(1 + b) instead of multiplying, and they always reason first, so the app sets `reasoning_effort` to
+low unless `--think` is given.
+
+Exactness: the same greedy answer from plain llama.cpp and from stowaway, packed and slimmed, with a 4 GB cache and a
+0.3 GB one (252 experts overflowed): identical. Slimming the 20b: 11.5 GB -> 1.9 GB plus 9.7 GB packed.
+
+Speed (VMs capped at 3 GB/s, the app, 128 tokens, 3 prompts; `vm/gptoss-speed.sh`):
+
+| | 4 GB | 8 GB | 16 GB |
+|---|---|---|---|
+| gpt-oss-20b | 2.3-2.4 tok/s | 6.7-9.3 | |
+| gpt-oss-120b | | 2.1-2.5 | |
+| gpt-oss-120b with cache-aware routing (bonus 1.0) | | 4.1-4.6 | 4.1-4.9 |
+
+**But gpt-oss is far more sensitive to expert swaps.** gpt-oss-20b, one token at a time, 2 x 512 WikiText, the 8 GB
+plan's 3.5 GB cache (`vm/gptoss-kld*.sh`):
+
+| Cache-aware bonus | Picks switched | Same top token | Mean KLD |
+|---|---|---|---|
+| none, hook on (control) | 0% | 100% | 0.000001 |
+| 0.25 | 4.9% | 82.2% | 0.090 |
+| 1.0 | 8.2% | 73.5% | 0.141 |
+| 1.0, only the 4th pick swappable (`MOE_CACHE_PROTECT=3`) | 4.5% | 81.8% | 0.074 |
+
+gpt-oss uses only 4 experts per token, so each one carries more of the output. (Its baseline perplexity on raw
+WikiText is ~230, because it's trained on its chat format, which also inflates KL divergence; the gap to Qwen is still
+large.) So `--fast` is not used for gpt-oss models: the app says so and runs them exactly. gpt-oss-120b at ~2.3 tok/s is
+still the best big model for 8 GB, about 4x the Qwen 122B at Q8 (section 18).
+
+**A measurement fix found on the way:** with the hook on but nothing swapped, output still drifted a little (KLD 0.004
+on Qwen, 0.015 on gpt-oss). The hook could change the *order* of the chosen experts, which changes the order their
+outputs are summed in, and so the rounding. The hook now writes scores so that the chosen set keeps the model's own
+order, which makes a zero-swap run bit-identical. Re-measured Qwen 35B with the fix: bonus 1.0 KLD 0.028 / 93.3% same top
+token (was 0.029 / 93.1%), bonus 0.5 0.022 / 94.9%. The conclusions of sections 16 and 20 stand.
+
 ## What didn't work, and why
 - Sharing experts inside the helper's guess-checking batches (`MOE_BATCH_VERIFY=1`, 2-16 token batches; 122B Q8, 8 GB,
   3 GB/s, 3 prompts): answering 0.6/0.9/0.5 tok/s vs 0.6/0.8/0.5 without it. The batches only touch 15-26 experts

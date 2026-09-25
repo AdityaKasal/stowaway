@@ -32,7 +32,7 @@ if not FROZEN:
     sys.path.insert(0, str(HERE / "llama.cpp" / "gguf-py"))
 import gguf  # noqa: E402
 
-VERSION = "0.2.6"
+VERSION = "0.2.7"
 REPO = "AdityaKasal/stowaway"
 
 import pack_dense  # noqa: E402
@@ -134,8 +134,10 @@ def model_info(first):
     for p in parts:
         for t in gguf.GGUFReader(p).tensors:
             n = int(t.n_bytes)
-            if "_exps." in t.name:
+            if "_exps.weight" in t.name:
                 exp += n
+            elif "_exps." in t.name:  # per-expert biases (gpt-oss): small, left to the OS like the embeddings
+                dense += n
             elif t.name.startswith("token_embd"):
                 embd += n
             else:
@@ -290,6 +292,14 @@ CATALOG = {
     "qwen3.5-35b": {
         "about": "Qwen3.5 35B-A3B, Q5_K_M. ~5-8 words/s on 8 GB laptops, ~2 on 4 GB (normal NVMe).",
         "repo": "unsloth/Qwen3.5-35B-A3B-GGUF", "files": ["Qwen3.5-35B-A3B-Q5_K_M.gguf"], "gb": 26.2,
+    },
+    "gpt-oss-20b": {
+        "about": "OpenAI gpt-oss-20b (native MXFP4). ~7-9 words/s on 8 GB, ~2.4 on 4 GB (normal NVMe).",
+        "repo": "ggml-org/gpt-oss-20b-GGUF", "files": ["gpt-oss-20b-MXFP4.gguf"], "gb": 12.1,
+    },
+    "gpt-oss-120b": {
+        "about": "OpenAI gpt-oss-120b (native MXFP4). The big model for 8 GB: ~2.3 words/s (normal NVMe).",
+        "repo": "ggml-org/gpt-oss-120b-GGUF", "files": ["gpt-oss-120b-MXFP4.gguf"], "gb": 63.4,
     },
     "qwen3.5-122b": {
         "about": "Qwen3.5 122B-A10B, Q5_K_M. ~1 word/s on 8 GB, ~1.5-2 on 16 GB (normal NVMe; use --fast on 16 GB).",
@@ -546,6 +556,10 @@ def run(args):
     # pays when the cache holds at least one token's worth of experts: measured -39% reads on the 35B at 8 GB (cache =
     # 3.6 tokens' worth), nothing on the 122B Q8 at 8 GB (0.13), where it would only change the output.
     fast_answer = args.fast and plan["cache_gb"] >= info["active_expert_gb"]
+    if args.fast and info["arch"] == "gpt-oss":
+        # measured: gpt-oss is far more sensitive to expert swaps (73-82% same top token vs 93% for Qwen; RESULTS.md 22)
+        print("fast:    not used for gpt-oss models: swapping their experts changes the answers too much")
+        args.fast = fast_answer = False
     if args.fast:
         print("fast:    while reading your question, words whose choice of expert is close share experts that are read "
               "anyway (a faster first word)" + ("; while answering, prefers experts already in memory" if fast_answer else
@@ -573,6 +587,8 @@ def run(args):
               "-t", str(args.threads), "-tb", str(os.cpu_count() or args.threads), "-n", str(args.n),
               "--no-warmup",  # warmup runs every expert once, which fills the small cache with junk
               "-rea", "on" if args.think else "off"]
+    if info["arch"] == "gpt-oss":  # always reasons first; keep that short unless --think
+        common += ["--chat-template-kwargs", '{"reasoning_effort": "%s"}' % ("medium" if args.think else "low")]
     if guess and info["mtp"] and not draft:
         common += MTP_FLAGS
     elif guess and draft:

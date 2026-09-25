@@ -72,7 +72,7 @@ def repack(first, out, slim=False):
     readers = _readers(parts)
     for pi, r in enumerate(readers):
         for t in r.tensors:
-            if "_exps." in t.name:
+            if "_exps.weight" in t.name:  # expert weights; per-expert biases (gpt-oss) stay in the model file
                 kind = t.name.split(".")[2]
                 layers[int(t.name.split(".")[1])].append((order[kind], t.name, pi, int(t.data_offset), int(t.n_bytes)))
     del readers, r, t
@@ -172,7 +172,7 @@ def slim_after(first, out):
     freed = 0
     for p in parts:
         r = gguf.GGUFReader(p)
-        ranges = [(int(t.data_offset), int(t.n_bytes)) for t in r.tensors if "_exps." in t.name]
+        ranges = [(int(t.data_offset), int(t.n_bytes)) for t in r.tensors if "_exps.weight" in t.name]
         del r
         import gc
         gc.collect()

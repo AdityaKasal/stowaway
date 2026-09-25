@@ -31,10 +31,10 @@ index d8319cd..7eb83f7 100644
      }
 diff --git a/common/moe-stream.h b/common/moe-stream.h
 new file mode 100644
-index 0000000..057e6bc
+index 0000000..c87bde7
 --- /dev/null
 +++ b/common/moe-stream.h
-@@ -0,0 +1,1912 @@
+@@ -0,0 +1,1944 @@
 +// moe-stream: run Mixture-of-Experts models that are much bigger than RAM (moe-router-study).
 +//
 +// - expert_cache: keeps recently used experts in a fixed block of RAM and reads missing ones straight from the model
@@ -862,8 +862,8 @@ index 0000000..057e6bc
 +            const size_t data = gguf_get_data_offset(g);
 +            for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
 +                const std::string name = gguf_get_tensor_name(g, i);
-+                if (name.find("_exps.") == std::string::npos) {
-+                    continue;
++                if (name.find("_exps.weight") == std::string::npos) {
++                    continue; // expert weights only; small per-expert biases (gpt-oss) stay in the model file
 +                }
 +                const size_t per = gguf_get_tensor_size(g, i) / n_expert;
 +                by_name[name] = { atoi(name.c_str() + 4), fi, data + gguf_get_tensor_offset(g, i), per, {} };
@@ -1505,7 +1505,35 @@ index 0000000..057e6bc
 +        return true;
 +    }
 +
-+    void rerank_batch(float * scores, int n_expert, int n_tok, int k, int layer) {
++    // After boosting, pick the new top-k set, then write scores so that exactly that set ranks first while keeping the
++    // model's original order inside it. With no swap the set and its order are unchanged, so the output is bit-identical
++    // (the experts' outputs are summed in the same order). Measured before this: a zero-swap run drifted (KLD 0.004 on
++    // Qwen, 0.015 on gpt-oss) only because the chosen experts came out in a different order.
++    std::vector<float> keep_orig;
++    std::vector<int32_t> order_tmp;
++    void lift_topk(float * v, const float * orig, int n_expert, int k) {
++        order_tmp.resize(n_expert);
++        for (int e = 0; e < n_expert; e++) order_tmp[e] = e;
++        std::partial_sort(order_tmp.begin(), order_tmp.begin() + k, order_tmp.end(),
++                          [&](int32_t x, int32_t y) { return v[x] > v[y]; });
++        // the chosen set, in the model's own order (by original score; index breaks ties like a stable sort would)
++        std::sort(order_tmp.begin(), order_tmp.begin() + k,
++                  [&](int32_t x, int32_t y) { return orig[x] > orig[y] || (orig[x] == orig[y] && x < y); });
++        for (int e = 0; e < n_expert; e++) v[e] = orig[e];
++        // exact integers far above any probability or logit: the set ranks first, in that order, with no rounding ties
++        for (int i = 0; i < k; i++) v[order_tmp[i]] = 1.0e6f - (float) i;
++    }
++
++    // favor expert e: multiply a probability by (1 + b), or add ln(1 + b) to a raw logit (the same thing after softmax)
++    static void boost(float & v, float bonus, bool logits) {
++        if (logits) {
++            v += std::log1p(bonus);
++        } else {
++            v *= 1.0f + bonus;
++        }
++    }
++
++    void rerank_batch(float * scores, int n_expert, int n_tok, int k, int layer, bool logits) {
 +        batch_cnt.assign(n_expert, 0);
 +        batch_hot.assign(n_expert, 0);
 +        route_a.resize(n_expert);
@@ -1526,14 +1554,16 @@ index 0000000..057e6bc
 +        std::vector<int> cnt2(n_expert, 0);
 +        for (int r = 0; r < n_tok; r++) {
 +            float * v = scores + (size_t) r * n_expert;
++            keep_orig.assign(v, v + n_expert);
 +            topk(v);
 +            std::fill(old_pick.begin(), old_pick.end(), 0);
 +            for (int i = 0; i < k; i++) old_pick[route_a[i]] = 1;
 +            for (int e = 0; e < n_expert; e++) {
 +                if (batch_hot[e]) {
-+                    v[e] *= 1.0f + batch_bonus;
++                    boost(v[e], batch_bonus, logits);
 +                }
 +            }
++            lift_topk(v, keep_orig.data(), n_expert, k);
 +            topk(v);
 +            for (int i = 0; i < k; i++) {
 +                cnt2[route_a[i]]++;
@@ -1548,7 +1578,7 @@ index 0000000..057e6bc
 +        batch_union_after  += after;
 +    }
 +
-+    void rerank(float * scores, int n_expert, int n_tok, int k, int layer) {
++    void rerank(float * scores, int n_expert, int n_tok, int k, int layer, bool logits) {
 +        if (k <= 0 || k >= n_expert || !by_layer.count(layer)) {
 +            return;
 +        }
@@ -1556,7 +1586,7 @@ index 0000000..057e6bc
 +            // prompts; and, with MOE_BATCH_VERIFY, the small batches that check a helper's guesses: several tokens
 +            // at once need the union of their experts, so sharing experts there cuts reads the same way
 +            if (batch_bonus > 0.0f) {
-+                rerank_batch(scores, n_expert, n_tok, k, layer);
++                rerank_batch(scores, n_expert, n_tok, k, layer, logits);
 +            }
 +            return;
 +        }
@@ -1575,15 +1605,17 @@ index 0000000..057e6bc
 +        };
 +        for (int r = 0; r < n_tok; r++) {
 +            float * v = scores + (size_t) r * n_expert;
++            keep_orig.assign(v, v + n_expert);
 +            top(v, route_a, keep);
 +            for (int e = 0; e < n_expert; e++) {
 +                if (resident(layer, e)) {
-+                    v[e] *= 1.0f + route_bonus;
++                    boost(v[e], route_bonus, logits);
 +                }
 +            }
 +            for (int i = 0; i < protect && i < 16; i++) {
 +                v[keep[i]] = 1e30f; // ranking only; the weight still comes from the real score
 +            }
++            lift_topk(v, keep_orig.data(), n_expert, k);
 +            top(v, route_b, nullptr);
 +            int same = 0;
 +            for (int i = 0, j = 0; i < k && j < k;) {
@@ -1596,8 +1628,8 @@ index 0000000..057e6bc
 +        }
 +    }
 +
-+    static void select_hook(float * scores, int n_expert, int n_tok, int k, int layer, void * ud) {
-+        ((expert_cache *) ud)->rerank(scores, n_expert, n_tok, k, layer);
++    static void select_hook(float * scores, int n_expert, int n_tok, int k, int layer, int logits, void * ud) {
++        ((expert_cache *) ud)->rerank(scores, n_expert, n_tok, k, layer, logits != 0);
 +    }
 +
 +    void print_stats() const {
@@ -2065,27 +2097,29 @@ index 8bb0ff7..22ca417 100644
          case GGML_OP_MUL_MAT_ID:
              {
 diff --git a/include/llama.h b/include/llama.h
-index 31bbf8b..5a4b516 100644
+index 31bbf8b..91bd2da 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -1029,6 +1029,12 @@ extern "C" {
+@@ -1029,6 +1029,14 @@ extern "C" {
      // Set abort callback
      LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
  
 +    // moe-stream: called with each MoE layer's expert scores ([n_expert] floats per token, before the top-k pick) so
 +    // the ranking can be adjusted in place, e.g. to prefer experts already in RAM. Only the pick changes: the chosen
 +    // experts' weights still come from the unmodified scores. Must be set before contexts are created. nullptr = off.
-+    typedef void (*llama_moe_select_hook)(float * scores, int n_expert, int n_tokens, int n_expert_used, int il, void * user_data);
++    // scores_are_logits: 1 when the ranking is on raw router logits (e.g. gpt-oss, softmax after top-k), 0 for probabilities.
++    typedef void (*llama_moe_select_hook)(float * scores, int n_expert, int n_tokens, int n_expert_used, int il,
++                                          int scores_are_logits, void * user_data);
 +    LLAMA_API void llama_set_moe_select_hook(llama_moe_select_hook hook, void * user_data);
 +
      // Wait until all computations are finished
      // This is automatically done when using one of the functions below to obtain the computation results
      // and is not necessary to call it explicitly in most cases
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 07ca49a..29e056f 100644
+index 07ca49a..bc0d485 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -1946,6 +1946,29 @@ ggml_tensor * llm_graph_context::build_ffn(
+@@ -1946,6 +1946,30 @@ ggml_tensor * llm_graph_context::build_ffn(
      return cur;
  }
  
@@ -2107,22 +2141,25 @@ index 07ca49a..29e056f 100644
 +    GGML_ASSERT(a->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
 +    memcpy(dst->data, a->data, ggml_nbytes(a));
 +    if (g_moe_select_hook) {
++        const int packed = (int) (intptr_t) userdata; // layer | logits flag << 24
 +        g_moe_select_hook((float *) dst->data, (int) a->ne[0], (int) ggml_nrows(a), g_moe_n_expert_used,
-+                          (int) (intptr_t) userdata, g_moe_select_hook_data);
++                          packed & 0xffffff, (packed >> 24) & 1, g_moe_select_hook_data);
 +    }
 +}
 +
  ggml_tensor * llm_graph_context::build_moe_ffn(
           ggml_tensor * cur,
           ggml_tensor * gate_inp,
-@@ -2067,6 +2090,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2067,6 +2091,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          cb(selection_probs, "ffn_moe_probs_biased", il);
      }
  
 +    // moe-stream: let the hook re-rank experts (the weights below still come from the unbiased probs)
 +    if (g_moe_select_hook != nullptr && selected_experts_in == nullptr) {
 +        g_moe_n_expert_used = (int) n_expert_used;
-+        selection_probs = ggml_map_custom1(ctx0, ggml_cont(ctx0, selection_probs), moe_select_op, 1, (void *) (intptr_t) il);
++        const int is_logits = selection_probs == logits ? 1 : 0; // softmax-after-top-k models rank on raw logits
++        selection_probs = ggml_map_custom1(ctx0, ggml_cont(ctx0, selection_probs), moe_select_op, 1,
++                                           (void *) (intptr_t) (il | (is_logits << 24)));
 +        cb(selection_probs, "ffn_moe_probs_hooked", il);
 +    }
 +
