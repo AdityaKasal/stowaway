@@ -399,8 +399,9 @@ def main(argv=None):
     ap.add_argument("-p", "--prompt", help="answer one prompt and exit")
     ap.add_argument("-n", type=int, default=512, help="max tokens per answer (default 512)")
     ap.add_argument("--plan", action="store_true", help="only print the plan")
-    ap.add_argument("--fast", action="store_true", help="prefer experts already in memory when the model's choice is "
-                    "close (about 1.5x less reading from disk; answers differ slightly from the full model)")
+    ap.add_argument("--fast", action="store_true", help="when the model's choice of expert is close, prefer one that is "
+                    "already in memory or already being read (30-40%% less reading from disk, so faster answers and a "
+                    "faster first word; answers differ slightly from the full model)")
     ap.add_argument("--think", action="store_true", help="let the model think out loud before answering (better on hard "
                     "questions, but on a slow machine it can take minutes before the answer starts)")
     ap.add_argument("-y", "--yes", action="store_true", help="don't ask before downloading")
@@ -474,8 +475,9 @@ def run(args):
         print(f"quality: using {args.experts} of {info['k']} experts per token - faster, but answers will differ "
               f"from the full model")
     if args.fast:
-        print("fast:    prefers experts already in memory when the model's choice is close - about 40% less reading "
-              "from disk; answers differ slightly from the full model (same top word ~93% of the time)")
+        print("fast:    when the model's choice of expert is close, prefers one already in memory (while answering) or "
+              "already being read (while reading your question) - about 30-40% less reading from disk; answers differ "
+              "slightly from the full model (same top word ~93% of the time)")
     if args.plan:
         return
 
@@ -486,7 +488,8 @@ def run(args):
                EXPERT_CACHE_PACKED=str(packed), EXPERT_CACHE_CHUNK_KB="8192", LLAMA_NO_MMAP_PREFETCH="1",
                CUDA_VISIBLE_DEVICES=os.environ.get("CUDA_VISIBLE_DEVICES", "-1"))
     if args.fast:
-        env["MOE_CACHE_BONUS"] = "1.0"  # cache-aware routing; measured: -39% expert reads, KLD 0.029 (RESULTS.md)
+        env["MOE_CACHE_BONUS"] = "1.0"  # cache-aware routing while answering: -39% expert reads, KLD 0.029 (RESULTS.md 16)
+        env["MOE_BATCH_BONUS"] = "1.0"  # batch-aware routing while reading the question: -31% reads, KLD 0.016 (RESULTS.md 20)
     if plan["dense_stream_gb"]:
         ensure_dense_packed(info, dense_packed)
         env["EXPERT_CACHE_DENSE_GB"] = f"{plan['dense_stream_gb']:.2f}"

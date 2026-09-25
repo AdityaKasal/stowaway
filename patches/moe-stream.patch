@@ -31,10 +31,10 @@ index d8319cd..7eb83f7 100644
      }
 diff --git a/common/moe-stream.h b/common/moe-stream.h
 new file mode 100644
-index 0000000..a050f76
+index 0000000..088243a
 --- /dev/null
 +++ b/common/moe-stream.h
-@@ -0,0 +1,1836 @@
+@@ -0,0 +1,1908 @@
 +// moe-stream: run Mixture-of-Experts models that are much bigger than RAM (moe-router-study).
 +//
 +// - expert_cache: keeps recently used experts in a fixed block of RAM and reads missing ones straight from the model
@@ -801,7 +801,7 @@ index 0000000..a050f76
 +        if (getenv("MOE_STATS") && (hits + misses)) {
 +            print_stats();
 +        }
-+        if (route_bonus > 0.0f) {
++        if (route_bonus > 0.0f || batch_bonus > 0.0f) {
 +            llama_set_moe_select_hook(nullptr, nullptr);
 +        }
 +        {
@@ -1482,6 +1482,13 @@ index 0000000..a050f76
 +    int    route_max_tokens = 16;  // only per-token steps (and small verify batches), not whole prompts
 +    int    route_protect = 0;      // the model's own top-N picks are never swapped out (MOE_CACHE_PROTECT)
 +    size_t route_picks = 0, route_swaps = 0;
++    // batch-aware routing for prompts (MOE_BATCH_BONUS): in a batch of many tokens, experts that several tokens already
++    // picked (or that are in RAM) get the bonus, so near-ties collapse onto experts that are read anyway. Fewer
++    // distinct experts per layer = fewer bytes to read before the first word. Changes the output.
++    float  batch_bonus = 0.0f;
++    size_t batch_ops = 0, batch_union_before = 0, batch_union_after = 0, batch_picks = 0, batch_swaps = 0;
++    std::vector<int> batch_cnt;
++    std::vector<char> batch_hot;
 +    std::vector<int32_t> route_a, route_b;
 +
 +    bool resident(int layer, int expert) {
@@ -1497,8 +1504,60 @@ index 0000000..a050f76
 +        return true;
 +    }
 +
++    void rerank_batch(float * scores, int n_expert, int n_tok, int k, int layer) {
++        batch_cnt.assign(n_expert, 0);
++        batch_hot.assign(n_expert, 0);
++        route_a.resize(n_expert);
++        auto topk = [&](const float * v) {
++            for (int e = 0; e < n_expert; e++) route_a[e] = e;
++            std::partial_sort(route_a.begin(), route_a.begin() + k, route_a.end(), [&](int32_t x, int32_t y) { return v[x] > v[y]; });
++        };
++        for (int r = 0; r < n_tok; r++) {
++            topk(scores + (size_t) r * n_expert);
++            for (int i = 0; i < k; i++) batch_cnt[route_a[i]]++;
++        }
++        int before = 0;
++        for (int e = 0; e < n_expert; e++) {
++            before += batch_cnt[e] > 0;
++            batch_hot[e] = batch_cnt[e] >= 2 || resident(layer, e); // read anyway (or free): make it attractive
++        }
++        std::vector<char> old_pick(n_expert);
++        std::vector<int> cnt2(n_expert, 0);
++        for (int r = 0; r < n_tok; r++) {
++            float * v = scores + (size_t) r * n_expert;
++            topk(v);
++            std::fill(old_pick.begin(), old_pick.end(), 0);
++            for (int i = 0; i < k; i++) old_pick[route_a[i]] = 1;
++            for (int e = 0; e < n_expert; e++) {
++                if (batch_hot[e]) {
++                    v[e] *= 1.0f + batch_bonus;
++                }
++            }
++            topk(v);
++            for (int i = 0; i < k; i++) {
++                cnt2[route_a[i]]++;
++                batch_swaps += !old_pick[route_a[i]];
++            }
++            batch_picks += k;
++        }
++        int after = 0;
++        for (int e = 0; e < n_expert; e++) after += cnt2[e] > 0;
++        batch_ops++;
++        batch_union_before += before;
++        batch_union_after  += after;
++    }
++
 +    void rerank(float * scores, int n_expert, int n_tok, int k, int layer) {
-+        if (route_bonus <= 0.0f || n_tok > route_max_tokens || k <= 0 || k >= n_expert || !by_layer.count(layer)) {
++        if (k <= 0 || k >= n_expert || !by_layer.count(layer)) {
++            return;
++        }
++        if (n_tok > route_max_tokens) {
++            if (batch_bonus > 0.0f) {
++                rerank_batch(scores, n_expert, n_tok, k, layer);
++            }
++            return;
++        }
++        if (route_bonus <= 0.0f) {
 +            return;
 +        }
 +        route_a.resize(n_expert);
@@ -1546,6 +1605,12 @@ index 0000000..a050f76
 +        if (pregated) {
 +            fprintf(stderr, "expert-cache: guesses: %zu loaded, %zu wrong (demoted or cancelled), %zu skipped (cache too full of recent experts), "
 +                            "%zu reads promoted to urgent\n", pregated, spec_wrong, spec_skipped, spec_promoted);
++        }
++        if (batch_ops) {
++            fprintf(stderr, "expert-cache: batch-aware routing (bonus %.2f): distinct experts per prompt op %.1f -> %.1f (%.0f%% fewer), "
++                            "%.1f%% of picks switched\n", batch_bonus, (double) batch_union_before / batch_ops,
++                    (double) batch_union_after / batch_ops, 100.0 * (1.0 - (double) batch_union_after / batch_union_before),
++                    100.0 * batch_swaps / std::max<size_t>(batch_picks, 1));
 +        }
 +        if (route_picks) {
 +            fprintf(stderr, "expert-cache: cache-aware routing (bonus %.2f): %zu of %zu expert picks switched to one already in RAM (%.1f%%)\n",
@@ -1847,6 +1912,13 @@ index 0000000..a050f76
 +    if (!cache.init(model_path, atof(gb), io ? atoi(io) : 4)) {
 +        fprintf(stderr, "moe-stream: could not start; running without it\n");
 +        return false;
++    }
++    if (const char * bb = getenv("MOE_BATCH_BONUS")) {
++        cache.batch_bonus = (float) atof(bb);
++        if (cache.batch_bonus > 0.0f) {
++            llama_set_moe_select_hook(expert_cache::select_hook, &cache);
++            fprintf(stderr, "moe-stream: batch-aware routing for prompts on (bonus %.0f%%; changes the output)\n", 100.0 * cache.batch_bonus);
++        }
 +    }
 +    if (const char * b = getenv("MOE_CACHE_BONUS")) {
 +        cache.route_bonus = (float) atof(b);

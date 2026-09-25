@@ -29,7 +29,7 @@ You need an SSD and about the model's size in free disk space, plus 10%. From a 
 stowaway list                      models it can download
 stowaway run qwen3.5-35b           download (asks first), set up, chat in the browser
 stowaway run qwen3.5-35b --cli     chat in the terminal
-stowaway run qwen3.5-35b --fast    ~40% less reading from disk; answers differ slightly (see below)
+stowaway run qwen3.5-35b --fast    faster answers and a faster first word; answers differ slightly (see below)
 stowaway run qwen3.5-35b --think   let the model think before answering (off by default: slow on slow machines)
 stowaway plan qwen3.5-122b         show the memory plan and expected speed
 stowaway run path/to/model.gguf    any other Mixture-of-Experts GGUF model (add --slim to halve its disk use)
@@ -57,9 +57,11 @@ Setup packs the experts once into a file laid out for fast reads. For models sto
 own copy of the experts is freed as it goes (the file keeps its size but the space is released), so a model needs
 about its own size on disk instead of twice.
 
-`--fast` turns on cache-aware routing: when the expert the model wants isn't in memory but a nearly-as-good one is,
-it uses that one. On the 8 GB setup this reads 39% less from disk, at a quality cost smaller than using 7 of the 8
-experts (RESULTS.md section 16). It's off by default because the answers change slightly.
+`--fast` turns on cache-aware routing. When the expert the model wants isn't in memory but a nearly-as-good one is,
+it uses that one (39% less reading while answering, on the 8 GB setup). While reading your question, it prefers
+experts that other words of the question already need, which makes the first word come ~75% sooner for the 122B on
+8 GB. The quality cost is measured and small (RESULTS.md sections 16 and 20), but it's off by default because the
+answers change slightly.
 
 The cache never changes the output: it's bit-identical to plain llama.cpp. Guessing ahead is the same model at the
 same quality, but llama.cpp's batched check rounds slightly differently, so an occasional word can differ.

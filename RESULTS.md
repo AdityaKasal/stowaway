@@ -537,6 +537,38 @@ is a clear surplus, and no helper model (its RAM is worth more to the streamed w
 A 4 GB Windows laptop (Windows itself uses ~2 GB) will usually have less than that free; a 4 GB Linux machine or
 Chromebook is the realistic target.
 
+## 20. Faster first word: batch-aware routing while reading the question (in `--fast`, changes the output)
+
+Reading a question runs all of its tokens through each layer together, so each layer reads the union of the experts
+the tokens picked: ~100 of 256 for a chat-sized question. On the 8 GB setup that's what makes the 122B take ~30 s to
+read a 40-token question (the drive is saturated). Batch-aware routing applies the cache-aware idea to the batch: an
+expert that two or more tokens already picked, or that is in RAM, gets a score bonus (1 + b), so near-ties collapse
+onto experts that are read anyway. Only which experts are picked changes; the weights come from the real scores. It
+applies to batches of more than 16 tokens (`MOE_BATCH_BONUS=b`).
+
+Quality and reads: 122B Q5 on the PC, question-sized batches (48 tokens), WikiText-2 3 x 512, KLD against no bonus
+(`pc/batch-sweep.ps1`, logs `results/batchroute/` on the PC). Every token here is read in batch mode, so this
+overstates the effect on a chat, where only the question is:
+
+| Bonus | Distinct experts per batch | Expert data read | Same top token | Mean KLD | Wall time |
+|---|---|---|---|---|---|
+| none | 106.6 | 100% | 100% | 0 | 347 s |
+| 0.25 | 88.2 | 83% | 98.0% | 0.008 | 285 s |
+| 0.5 | 80.1 | 75% | 97.5% | 0.009 | 266 s |
+| **1.0** | **73.7** | **69%** | **96.2%** | **0.016** | **249 s** |
+| 2.0 | 69.6 | 65% | 95.4% | 0.021 | 242 s |
+
+Time to first word, 122B Q8 on the 8 GB / 3 GB/s VM, two chat questions, the released app (`vm/ttfw-test.sh`):
+
+| Question | Question reading, normal | with bonus 1.0 | Whole run (load + question + 8 tokens) |
+|---|---|---|---|
+| Japan trip (~40 tokens) | 1.3 tok/s | 2.3 tok/s | 67 s -> 53 s |
+| Roth vs traditional IRA | 1.2 tok/s | 2.1 tok/s | 62 s -> 51 s |
+
+Question reading got ~75% faster for 33% fewer distinct experts. The drop from ~100 to ~67 experts per layer lets the
+batch fit in the 8 GB plan's 0.5 GB cache (~72 slots), so the overflow path (reads through the packed mapping) is no
+longer needed. `--fast` now turns this on together with cache-aware routing (section 16); the default stays exact.
+
 ## What didn't work, and why
 
 - **Windows PrefetchVirtualMemory called inline** made things 3× slower (it blocks while walking the range). Moving
