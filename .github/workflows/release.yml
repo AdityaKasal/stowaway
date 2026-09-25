@@ -1,0 +1,130 @@
+# Builds the four stowaway downloads, tests each end to end with a tiny MoE model, and attaches them to the release
+# when a v* tag is pushed. Run it by hand (Actions -> build -> Run workflow) to get the zips as artifacts only.
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  LLAMA_COMMIT: d2e54583c7452353eb35d40431281f6ee984332f
+  COMMON: >-
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DLLAMA_CURL=OFF
+    -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TOOLS=ON
+  FAST: -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
+  COMPAT: -DGGML_SSE42=ON -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_BMI2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows, os: windows-2022 }
+          - { name: linux, os: ubuntu-22.04 }
+          - { name: mac, os: macos-14 }
+          - { name: mac-intel, os: macos-15-intel }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: llama.cpp with the moe-stream patch
+        run: |
+          git clone -q https://github.com/ggml-org/llama.cpp
+          git -C llama.cpp checkout -q $LLAMA_COMMIT
+          git -C llama.cpp apply "$GITHUB_WORKSPACE/patches/moe-stream.patch"
+
+      - name: build the engine (Windows)
+        if: matrix.name == 'windows'
+        run: |
+          cmake -S llama.cpp -B build -A x64 $COMMON $FAST -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake --build build --config Release --target llama-cli llama-server -j 4
+          cmake -S llama.cpp -B build-compat -A x64 $COMMON $COMPAT -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake --build build-compat --config Release --target llama-cli llama-server -j 4
+          echo "ENGINE=build/bin/Release" >> $GITHUB_ENV
+          echo "ENGINE_COMPAT=build-compat/bin/Release" >> $GITHUB_ENV
+
+      - name: build the engine (Linux)
+        if: matrix.name == 'linux'
+        run: |
+          LD="-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"
+          cmake -S llama.cpp -B build $COMMON $FAST "$LD"
+          cmake --build build --target llama-cli llama-server -j 4
+          cmake -S llama.cpp -B build-compat $COMMON $COMPAT "$LD"
+          cmake --build build-compat --target llama-cli llama-server -j 4
+          echo "ENGINE=build/bin" >> $GITHUB_ENV
+          echo "ENGINE_COMPAT=build-compat/bin" >> $GITHUB_ENV
+          echo "AVX instructions in the compat engine: $(objdump -d --no-show-raw-insn build-compat/bin/llama-cli | grep -c '%ymm')"
+
+      - name: build the engine (Apple Silicon Mac)
+        if: matrix.name == 'mac'
+        run: |
+          cmake -S llama.cpp -B build $COMMON -DGGML_METAL=OFF -DGGML_BLAS=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+          cmake --build build --target llama-cli llama-server -j 4
+          echo "ENGINE=build/bin" >> $GITHUB_ENV
+
+      - name: build the engine (Intel Mac)
+        if: matrix.name == 'mac-intel'
+        run: |
+          MAC="-DGGML_METAL=OFF -DGGML_BLAS=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0"
+          cmake -S llama.cpp -B build $COMMON $FAST $MAC
+          cmake --build build --target llama-cli llama-server -j 4
+          cmake -S llama.cpp -B build-compat $COMMON $COMPAT $MAC
+          cmake --build build-compat --target llama-cli llama-server -j 4
+          echo "ENGINE=build/bin" >> $GITHUB_ENV
+          echo "ENGINE_COMPAT=build-compat/bin" >> $GITHUB_ENV
+
+      - name: build the launcher
+        run: |
+          python -m pip install -q numpy pyyaml pyinstaller
+          python -m PyInstaller --onefile --name stowaway --paths llama.cpp/gguf-py --noconfirm --exclude-module tkinter moe.py
+          python packaging/make_dist.py ${{ matrix.name }} "$ENGINE" ${ENGINE_COMPAT:-}
+
+      - name: end-to-end test with a tiny MoE model
+        env:
+          STOWAWAY_NO_UPDATE_CHECK: "1"
+        run: |
+          curl -sL -o tiny.gguf https://huggingface.co/ggml-org/stories15M_MOE/resolve/main/stories15M_MOE-Q8_0.gguf
+          D=stowaway-${{ matrix.name }}
+          $D/stowaway --version
+          MOE_HOME=$PWD/home $D/stowaway run tiny.gguf --slim -p "Once upon a time" -n 16 < /dev/null > out.txt 2>&1 || { cat out.txt; exit 1; }
+          grep -E "Generation" out.txt
+          if [ -d $D/compat ]; then
+            STOWAWAY_COMPAT=1 MOE_HOME=$PWD/home $D/stowaway run tiny.gguf -p "Once upon a time" -n 16 < /dev/null > out2.txt 2>&1 || { cat out2.txt; exit 1; }
+            grep -E "^cpu|Generation" out2.txt
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stowaway-${{ matrix.name }}
+          path: stowaway-${{ matrix.name }}.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: attach the zips to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          NOTES=release-notes/$TAG.md
+          [ -f "$NOTES" ] || { echo "Downloads for $TAG." > /tmp/notes.md; NOTES=/tmp/notes.md; }
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "stowaway $TAG" --notes-file "$NOTES"
+          gh release upload "$TAG" stowaway-*.zip --clobber
