@@ -32,6 +32,9 @@ if not FROZEN:
     sys.path.insert(0, str(HERE / "llama.cpp" / "gguf-py"))
 import gguf  # noqa: E402
 
+VERSION = "0.2.4"
+REPO = "AdityaKasal/stowaway"
+
 import pack_dense  # noqa: E402
 import repack_experts  # noqa: E402
 
@@ -191,6 +194,19 @@ def make_plan(info, ram_gb, drive, draft_gb=0.0):
 
 
 # ---------------------------------------------------------------- run
+
+def free_port(port):
+    """The requested port, or the next free one (e.g. when a chat is already running)."""
+    import socket
+    for p in range(port, port + 50):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+            try:
+                sk.bind(("127.0.0.1", p))
+                return p
+            except OSError:
+                continue
+    return port
+
 
 def find_bin(name, bin_dir):
     exe = name + (".exe" if platform.system() == "Windows" else "")
@@ -381,9 +397,30 @@ def menu():
         raise
 
 
+def check_for_update():
+    """One quick look at GitHub for a newer release (3 s at most, never fatal). STOWAWAY_NO_UPDATE_CHECK=1 turns it off."""
+    if os.environ.get("STOWAWAY_NO_UPDATE_CHECK"):
+        return
+    try:
+        import json
+        import urllib.request
+        req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/releases/latest",
+                                     headers={"User-Agent": f"stowaway/{VERSION}", "Accept": "application/vnd.github+json"})
+        tag = json.load(urllib.request.urlopen(req, timeout=3)).get("tag_name", "")
+        latest = tuple(int(x) for x in tag.lstrip("v").split(".") if x.isdigit())
+        if latest > tuple(int(x) for x in VERSION.split(".")):
+            print(f"update:  stowaway {tag} is available (you have v{VERSION}): https://github.com/{REPO}/releases/latest\n")
+    except Exception:
+        pass
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("--version", "version", "-V"):
+        print(f"stowaway {VERSION}")
+        return
     if not argv and sys.stdin.isatty():
+        check_for_update()
         return menu()
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
@@ -393,6 +430,8 @@ def main(argv=None):
     cmd = "run"
     if argv[0] in ("run", "plan"):
         cmd = argv.pop(0)
+    if cmd == "run" and sys.stdin.isatty():
+        check_for_update()
     ap = argparse.ArgumentParser(prog=f"stowaway {cmd}")
     ap.add_argument("model", help="a model name from 'stowaway list', or a path to a .gguf file")
     ap.add_argument("--cli", action="store_true", help="chat in the terminal instead of the browser")
@@ -519,23 +558,38 @@ def run(args):
             cmd += ["-p", args.prompt, "-st", "--simple-io", "--no-display-prompt"]
         sys.exit(subprocess.call(cmd, env=env))
 
-    cmd = [str(find_bin("llama-server", args.bin))] + common + ["--host", "127.0.0.1", "--port", str(args.port)]
-    print(f"starting the chat at http://127.0.0.1:{args.port} (Ctrl+C to stop)...", flush=True)
-    proc = subprocess.Popen(cmd, env=env)
+    port = free_port(args.port)
+    cmd = [str(find_bin("llama-server", args.bin))] + common + ["--host", "127.0.0.1", "--port", str(port)]
+    log_path = models_dir() / "logs" / f"stowaway-server-{port}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    url = f"http://127.0.0.1:{port}"
+    print(f"loading the model (the engine's messages go to {log_path})...", flush=True)
+    with open(log_path, "w", encoding="utf-8", errors="replace") as log:
+        proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
     import urllib.request
-    for _ in range(600):
+    t0 = time.time()
+    while True:
         try:
-            if urllib.request.urlopen(f"http://127.0.0.1:{args.port}/health", timeout=1).status == 200:
-                webbrowser.open(f"http://127.0.0.1:{args.port}")
+            if urllib.request.urlopen(f"{url}/health", timeout=1).status == 200:
                 break
         except Exception:
             if proc.poll() is not None:
-                sys.exit("the server stopped; see the messages above")
+                tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-15:]
+                print("\n".join(tail))
+                sys.exit(f"\nthe engine stopped before the chat was ready; the full log is in {log_path}")
+            if time.time() - t0 > 900:
+                proc.terminate()
+                sys.exit(f"the chat didn't start within 15 minutes; see {log_path}")
             time.sleep(1)
+    print(f"\nYour chat is ready: {url}")
+    print("It should open in your web browser now. If it doesn't, copy that address into your browser.")
+    print("Keep this window open while you chat. Closing it (or pressing Ctrl+C) turns the AI off.\n", flush=True)
+    webbrowser.open(url)
     try:
         proc.wait()
     except KeyboardInterrupt:
         proc.terminate()
+        print("stopped.")
 
 
 if __name__ == "__main__":

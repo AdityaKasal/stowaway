@@ -37,6 +37,9 @@ stowaway run path/to/model.gguf    any other Mixture-of-Experts GGUF model (add 
 
 For a step-by-step walkthrough for non-technical people, see the setup guide (ask Aditya for the link).
 
+At start it checks GitHub for a newer version (set `STOWAWAY_NO_UPDATE_CHECK=1` to turn that off); `stowaway --version`
+shows yours.
+
 Windows says "Windows protected your PC" the first time: click More info, then Run anyway. On a Mac, if it
 won't open, run `xattr -dr com.apple.quarantine .` in the unzipped folder. Linux needs glibc 2.34+ and an
 x86-64 CPU with AVX2.
