@@ -6,6 +6,12 @@ Run big AI models on an ordinary computer: no graphics card, 8 GB of RAM.
 **Qwen3.5-35B-A3B at Q5** (26 GB) at conversation speed on the same machine. Normally both need a big GPU or a lot
 of RAM. The quality is unchanged: it's the full Q5 model, not a smaller or more compressed one.
 
+![moe chatting with Qwen3.5-35B-A3B Q5 in the browser](docs/chat.gif)
+
+*Real time, not sped up: Qwen3.5-35B-A3B Q5 in the browser chat that `moe` opens. Recorded on a MacBook Pro (M5 Pro)
+with `moe` limited to 5.5 GB of RAM, about what an 8 GB laptop has free. That Mac's SSD is fast; a typical 8 GB
+laptop gets about half this speed (see the table below).*
+
 ## Download
 
 Get the zip for your computer from [Releases](../../releases/latest), unzip it, and double-click `moe`.
@@ -23,6 +29,7 @@ You need an SSD and about twice the model's size in free disk space. From a term
 moe list                      models it can download
 moe run qwen3.5-35b           download (asks first), set up, chat in the browser
 moe run qwen3.5-35b --cli     chat in the terminal
+moe run qwen3.5-35b --think   let the model think before answering (off by default: slow on slow machines)
 moe plan qwen3.5-122b         show the memory plan and expected speed
 moe run path/to/model.gguf    any other Mixture-of-Experts GGUF model
 ```

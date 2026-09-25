@@ -245,6 +245,9 @@ def models_dir():
 def ask(question, default_yes, assume_yes):
     if assume_yes:
         return True
+    if not sys.stdin.isatty():  # nobody to answer (a script, a pipe): don't download anything
+        print(f"{question} no (not interactive; use --yes)")
+        return False
     try:
         a = input(f"{question} [{'Y/n' if default_yes else 'y/N'}] ").strip().lower()
     except EOFError:
@@ -377,6 +380,8 @@ def main(argv=None):
     ap.add_argument("-p", "--prompt", help="answer one prompt and exit")
     ap.add_argument("-n", type=int, default=512, help="max tokens per answer (default 512)")
     ap.add_argument("--plan", action="store_true", help="only print the plan")
+    ap.add_argument("--think", action="store_true", help="let the model think out loud before answering (better on hard "
+                    "questions, but on a slow machine it can take minutes before the answer starts)")
     ap.add_argument("-y", "--yes", action="store_true", help="don't ask before downloading")
     ap.add_argument("--ram", type=float, help="pretend this many GB are free (default: measure)")
     ap.add_argument("--threads", type=int, default=min(8, max(2, (os.cpu_count() or 4) // 2)))
@@ -455,7 +460,8 @@ def run(args):
         env["EXPERT_CACHE_DENSE_PACKED"] = str(dense_packed)
     common = ["-m", str(first), "-ngl", "0", "--no-repack", "--no-op-offload", "-c", "4096", "-b", "128", "-ub", "128",
               "-t", str(args.threads), "-tb", str(os.cpu_count() or args.threads), "-n", str(args.n),
-              "--no-warmup"]  # warmup runs every expert once, which fills the small cache with junk
+              "--no-warmup",  # warmup runs every expert once, which fills the small cache with junk
+              "-rea", "on" if args.think else "off"]
     if guess and info["mtp"] and not draft:
         common += MTP_FLAGS
     elif guess and draft:
