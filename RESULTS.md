@@ -575,6 +575,20 @@ Question reading got ~75% faster for 33% fewer distinct experts. The drop from ~
 batch fit in the 8 GB plan's 0.5 GB cache (~72 slots), so the overflow path (reads through the packed mapping) is no
 longer needed. `--fast` now turns this on together with cache-aware routing (section 16); the default stays exact.
 
+## 21. The 122B on a 16 GB machine (2026-09-25)
+
+122B Q8, 16 GB / 4 CPU / no-swap VM, disk capped at 3 GB/s, the released app (v0.2.3), 96 tokens (`vm/ram16-test.sh`).
+The plan keeps the always-needed weights in RAM and gives the experts a 7.3 GB cache:
+
+| Run | Question reading | Answering |
+|---|---|---|
+| plain (sky, story) | 1.7-1.8 tok/s | 1.4 tok/s |
+| `--fast` (sky, story) | 1.9-2.0 | **1.9-2.0** |
+| helper model | 1.8 | 1.3 (the app doesn't guess when dense fits in RAM) |
+
+Twice the 8 GB speed (0.6), and `--fast` adds ~40%: its answering part switched 18-21% of picks to experts already in
+the 7.3 GB cache, which is ~1.9 tokens' worth of Q8 experts, above the 1x threshold (section 16). No OOM kills.
+
 ## What didn't work, and why
 
 - **Windows PrefetchVirtualMemory called inline** made things 3× slower (it blocks while walking the range). Moving

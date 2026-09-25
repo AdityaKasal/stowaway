@@ -247,7 +247,7 @@ CATALOG = {
         "repo": "unsloth/Qwen3.5-35B-A3B-GGUF", "files": ["Qwen3.5-35B-A3B-Q5_K_M.gguf"], "gb": 26.2,
     },
     "qwen3.5-122b": {
-        "about": "Qwen3.5 122B-A10B, Q5_K_M. Runs on 8 GB but slowly (~1 word/s on a normal NVMe); better with 16 GB+.",
+        "about": "Qwen3.5 122B-A10B, Q5_K_M. ~1 word/s on 8 GB, ~1.5-2 on 16 GB (normal NVMe; use --fast on 16 GB).",
         "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
         "files": [f"Q5_K_M/Qwen3.5-122B-A10B-Q5_K_M-0000{i}-of-00003.gguf" for i in (1, 2, 3)], "gb": 91.5,
     },
