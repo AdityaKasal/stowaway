@@ -606,7 +606,7 @@ Speed (VMs capped at 3 GB/s, the app, 128 tokens, 3 prompts; `vm/gptoss-speed.sh
 | | 4 GB | 8 GB | 16 GB |
 |---|---|---|---|
 | gpt-oss-20b | 2.3-2.4 tok/s | 6.7-9.3 | |
-| gpt-oss-120b | | 2.1-2.5 | |
+| gpt-oss-120b | 0.7 (small-machine mode, streaming; lowest free 1.2 GB) | 2.1-2.5 | |
 | gpt-oss-120b with cache-aware routing (bonus 1.0) | | 4.1-4.6 | 4.1-4.9 |
 
 **But gpt-oss is far more sensitive to expert swaps.** gpt-oss-20b, one token at a time, 2 x 512 WikiText, the 8 GB

@@ -298,7 +298,7 @@ CATALOG = {
         "repo": "ggml-org/gpt-oss-20b-GGUF", "files": ["gpt-oss-20b-MXFP4.gguf"], "gb": 12.1,
     },
     "gpt-oss-120b": {
-        "about": "OpenAI gpt-oss-120b (native MXFP4). The big model for 8 GB: ~2.3 words/s (normal NVMe).",
+        "about": "OpenAI gpt-oss-120b (native MXFP4). The big model for 8 GB: ~2.3 words/s; even 4 GB: ~0.7.",
         "repo": "ggml-org/gpt-oss-120b-GGUF", "files": ["gpt-oss-120b-MXFP4.gguf"], "gb": 63.4,
     },
     "qwen3.5-122b": {
