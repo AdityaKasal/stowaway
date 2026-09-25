@@ -32,7 +32,7 @@ if not FROZEN:
     sys.path.insert(0, str(HERE / "llama.cpp" / "gguf-py"))
 import gguf  # noqa: E402
 
-VERSION = "0.2.5"
+VERSION = "0.2.6"
 REPO = "AdityaKasal/stowaway"
 
 import pack_dense  # noqa: E402

@@ -14,7 +14,8 @@ laptop gets about half this speed (see the table below).*
 
 ## Download
 
-Get the zip for your computer from [Releases](../../releases/latest), unzip it, and double-click `stowaway`.
+Get the zip for your computer from [Releases](../../releases/latest) (Windows, Linux, Apple Silicon Mac or Intel Mac),
+unzip it, and double-click `stowaway`.
 Pick a model; it shows the download size and asks before downloading anything. After a one-time setup, a chat opens
 in your browser.
 
@@ -96,8 +97,8 @@ pip install numpy pyyaml
 python moe.py list          # the app is moe.py; release builds name it stowaway
 ```
 
-The release builds use `pc/build-dist.ps1` (Windows), `vm/build-dist.sh` (Linux, Ubuntu 22.04) and the Mac recipe
-further down. Built on [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT).
+Release downloads are built and tested by GitHub Actions (`.github/workflows/release.yml`): pushing a `v*` tag builds
+all four, runs each end to end on a tiny MoE model, and attaches them to the release. Built on [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT).
 
 # Research notes
 
