@@ -474,10 +474,15 @@ def run(args):
     if fewer:
         print(f"quality: using {args.experts} of {info['k']} experts per token - faster, but answers will differ "
               f"from the full model")
+    # --fast: batch-aware routing while reading the question always cuts reads. Cache-aware routing while answering only
+    # pays when the cache holds at least one token's worth of experts: measured -39% reads on the 35B at 8 GB (cache =
+    # 3.6 tokens' worth), nothing on the 122B Q8 at 8 GB (0.13), where it would only change the output.
+    fast_answer = args.fast and plan["cache_gb"] >= info["active_expert_gb"]
     if args.fast:
-        print("fast:    when the model's choice of expert is close, prefers one already in memory (while answering) or "
-              "already being read (while reading your question) - about 30-40% less reading from disk; answers differ "
-              "slightly from the full model (same top word ~93% of the time)")
+        print("fast:    while reading your question, words whose choice of expert is close share experts that are read "
+              "anyway (a faster first word)" + ("; while answering, prefers experts already in memory" if fast_answer else
+              "; answering uses the model's own choices (the memory cache is too small here for that to help)")
+              + ". Answers differ slightly from the full model")
     if args.plan:
         return
 
@@ -488,8 +493,9 @@ def run(args):
                EXPERT_CACHE_PACKED=str(packed), EXPERT_CACHE_CHUNK_KB="8192", LLAMA_NO_MMAP_PREFETCH="1",
                CUDA_VISIBLE_DEVICES=os.environ.get("CUDA_VISIBLE_DEVICES", "-1"))
     if args.fast:
-        env["MOE_CACHE_BONUS"] = "1.0"  # cache-aware routing while answering: -39% expert reads, KLD 0.029 (RESULTS.md 16)
         env["MOE_BATCH_BONUS"] = "1.0"  # batch-aware routing while reading the question: -31% reads, KLD 0.016 (RESULTS.md 20)
+        if fast_answer:
+            env["MOE_CACHE_BONUS"] = "1.0"  # cache-aware routing while answering: -39% expert reads, KLD 0.029 (RESULTS.md 16)
     if plan["dense_stream_gb"]:
         ensure_dense_packed(info, dense_packed)
         env["EXPERT_CACHE_DENSE_GB"] = f"{plan['dense_stream_gb']:.2f}"

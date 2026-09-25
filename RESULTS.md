@@ -462,6 +462,12 @@ Keeping the model's own top-ranked pick regardless (`MOE_CACHE_PROTECT=1`) chang
 KLD 0.028 vs 0.029, same reads), and keeping the top two (`MOE_CACHE_PROTECT=2`) didn't either (0.031). The top
 picks are rarely the ones that get switched, so the plain bonus stays.
 
+When it helps (35B Q5, one token at a time, 512 tokens, `pc/route-threshold.ps1`), by expert cache size measured in
+tokens' worth of experts (0.74 GB per token): 0.5x (0.37 GB) no switches and no saving, because the previous token's
+experts for a layer are already evicted when that layer routes; 1x (0.75 GB) 45% fewer reads (24% of picks switched);
+2x (1.5 GB) 39% fewer; 3.6x (2.7 GB, the table above) 39% fewer. The 122B Q8 on 8 GB (0.13x) gained nothing (section 18).
+So `--fast` turns this part on only when the cache holds at least one token's worth of experts.
+
 Prior art note: colibri (github.com/JustVugg/colibri) deliberately never changes routing. Here it is opt-in and the
 app says the answers will differ.
 
