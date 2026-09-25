@@ -32,7 +32,7 @@ if not FROZEN:
     sys.path.insert(0, str(HERE / "llama.cpp" / "gguf-py"))
 import gguf  # noqa: E402
 
-VERSION = "0.2.4"
+VERSION = "0.2.5"
 REPO = "AdityaKasal/stowaway"
 
 import pack_dense  # noqa: E402
@@ -208,8 +208,37 @@ def free_port(port):
     return port
 
 
+def cpu_has_fast_path():
+    """The normal engine needs AVX2 + FMA + F16C + BMI2 (Intel 2013+, AMD 2015+). Older or budget CPUs get the
+    compatible (SSE4.2) engine from the compat/ folder. STOWAWAY_COMPAT=1 forces it."""
+    if os.environ.get("STOWAWAY_COMPAT"):
+        return False
+    machine = platform.machine().lower()
+    if machine not in ("x86_64", "amd64", "x64"):
+        return True  # Apple Silicon / ARM builds have no such split
+    try:
+        if platform.system() == "Windows":
+            return bool(ctypes.windll.kernel32.IsProcessorFeaturePresent(40))  # PF_AVX2_INSTRUCTIONS_AVAILABLE
+        if platform.system() == "Linux":
+            flags = next(l for l in open("/proc/cpuinfo") if l.startswith("flags")).split()
+            return all(f in flags for f in ("avx2", "fma", "f16c", "bmi2"))
+        if platform.system() == "Darwin":
+            out = subprocess.check_output(["/usr/sbin/sysctl", "-n", "machdep.cpu.leaf7_features", "machdep.cpu.features"]).decode().upper()
+            return "AVX2" in out and "FMA" in out and "F16C" in out and "BMI2" in out
+    except Exception:
+        pass
+    return True
+
+
 def find_bin(name, bin_dir):
     exe = name + (".exe" if platform.system() == "Windows" else "")
+    if not cpu_has_fast_path():
+        for d in ([Path(bin_dir)] if bin_dir else []) + [HERE]:
+            if (d / "compat" / exe).exists():
+                if not getattr(find_bin, "_told", False):
+                    print("cpu:     this processor lacks AVX2, so using the compatible engine (works everywhere, slower)")
+                    find_bin._told = True
+                return d / "compat" / exe
     for d in ([Path(bin_dir)] if bin_dir else []) + [HERE, HERE / "llama.cpp" / "build" / "bin", HERE / "build" / "bin"]:
         if (d / exe).exists():
             return d / exe

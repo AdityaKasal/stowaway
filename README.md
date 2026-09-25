@@ -41,8 +41,9 @@ At start it checks GitHub for a newer version (set `STOWAWAY_NO_UPDATE_CHECK=1` 
 shows yours.
 
 Windows says "Windows protected your PC" the first time: click More info, then Run anyway. On a Mac, if it
-won't open, run `xattr -dr com.apple.quarantine .` in the unzipped folder. Linux needs glibc 2.34+ and an
-x86-64 CPU with AVX2.
+won't open, run `xattr -dr com.apple.quarantine .` in the unzipped folder. Linux needs glibc 2.34+. On Windows and
+Linux PCs whose processor lacks AVX2 (most from before 2013, many budget Celerons), stowaway automatically uses a
+slower compatible engine that ships in the `compat` folder.
 
 ## How it works
 
