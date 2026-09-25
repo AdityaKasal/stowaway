@@ -590,6 +590,11 @@ Twice the 8 GB speed (0.6), and `--fast` adds ~40%: its answering part switched 
 the 7.3 GB cache, which is ~1.9 tokens' worth of Q8 experts, above the 1x threshold (section 16). No OOM kills.
 
 ## What didn't work, and why
+- Sharing experts inside the helper's guess-checking batches (`MOE_BATCH_VERIFY=1`, 2-16 token batches; 122B Q8, 8 GB,
+  3 GB/s, 3 prompts): answering 0.6/0.9/0.5 tok/s vs 0.6/0.8/0.5 without it. The batches only touch 15-26 experts
+  per layer, so there's little to share, and each pass is dominated by the streamed always-needed weights. It stays an
+  opt-in switch and isn't part of `--fast`. The question-reading part was again +60-80% in the same runs
+  (1.1-1.3 -> 1.9-2.3 tok/s).
 
 - **Windows PrefetchVirtualMemory called inline** made things 3× slower (it blocks while walking the range). Moving
   it to a helper thread fixed the slowdown, but it's still only a hint.

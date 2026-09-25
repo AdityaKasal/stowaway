@@ -31,10 +31,10 @@ index d8319cd..7eb83f7 100644
      }
 diff --git a/common/moe-stream.h b/common/moe-stream.h
 new file mode 100644
-index 0000000..088243a
+index 0000000..057e6bc
 --- /dev/null
 +++ b/common/moe-stream.h
-@@ -0,0 +1,1908 @@
+@@ -0,0 +1,1912 @@
 +// moe-stream: run Mixture-of-Experts models that are much bigger than RAM (moe-router-study).
 +//
 +// - expert_cache: keeps recently used experts in a fixed block of RAM and reads missing ones straight from the model
@@ -1486,6 +1486,7 @@ index 0000000..088243a
 +    // picked (or that are in RAM) get the bonus, so near-ties collapse onto experts that are read anyway. Fewer
 +    // distinct experts per layer = fewer bytes to read before the first word. Changes the output.
 +    float  batch_bonus = 0.0f;
++    bool   batch_verify = false; // also apply it to 2-16 token batches (verifying guessed tokens), MOE_BATCH_VERIFY
 +    size_t batch_ops = 0, batch_union_before = 0, batch_union_after = 0, batch_picks = 0, batch_swaps = 0;
 +    std::vector<int> batch_cnt;
 +    std::vector<char> batch_hot;
@@ -1551,7 +1552,9 @@ index 0000000..088243a
 +        if (k <= 0 || k >= n_expert || !by_layer.count(layer)) {
 +            return;
 +        }
-+        if (n_tok > route_max_tokens) {
++        if (n_tok > route_max_tokens || (n_tok > 1 && batch_verify)) {
++            // prompts; and, with MOE_BATCH_VERIFY, the small batches that check a helper's guesses: several tokens
++            // at once need the union of their experts, so sharing experts there cuts reads the same way
 +            if (batch_bonus > 0.0f) {
 +                rerank_batch(scores, n_expert, n_tok, k, layer);
 +            }
@@ -1915,6 +1918,7 @@ index 0000000..088243a
 +    }
 +    if (const char * bb = getenv("MOE_BATCH_BONUS")) {
 +        cache.batch_bonus = (float) atof(bb);
++        cache.batch_verify = getenv("MOE_BATCH_VERIFY") != nullptr;
 +        if (cache.batch_bonus > 0.0f) {
 +            llama_set_moe_select_hook(expert_cache::select_hook, &cache);
 +            fprintf(stderr, "moe-stream: batch-aware routing for prompts on (bonus %.0f%%; changes the output)\n", 100.0 * cache.batch_bonus);
