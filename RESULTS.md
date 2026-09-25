@@ -413,6 +413,76 @@ MTP and the helper are about even: MTP is steadier across kinds of text (~+50% o
 prose and worse on code. Either roughly doubles prose speed for the 122B on a budget laptop. Neither changes the
 basic limit: ~4 GB read per token from a 3 GB/s drive.
 
+## 15. Q8 on the 8 GB machine (2026-09-25)
+
+Q8 is the highest common quantization (close to the original model). The same 8 GB / 4 CPU / no-swap VM with the disk
+capped at 3 GB/s, the released Linux `moe`, 35B, 3 prompts x 128 tokens (`vm/q8-test.sh`):
+
+| Prompt | 35B Q5 (26.2 GB) | 35B Q8 (36.9 GB) |
+|---|---|---|
+| Sky is blue | 8.5 tok/s | 5.7 tok/s |
+| Python function | 7.6 | 5.1 |
+| Mystery story | 8.6 | 6.7 |
+| Average | 8.2 | 5.8 |
+
+Q8 reads ~1.7x more expert data per token and runs at ~70% of Q5's speed: still faster than reading speed on a
+cheap laptop. Lowest free memory during the runs was ~4 GB and there were no OOM kills. This VM runs nothing else
+(7.3 GB free), so a real 8 GB Windows laptop with a browser open will be somewhat slower.
+
+The 122B's always-needed weights are already Q8 inside the Q5_K_M file (5.84 GB either way, read from the GGUF
+headers over HTTP), so going from Q5 to Q8 only grows the experts (84.9 -> 123.2 GB). On 8 GB, where those
+always-needed weights are streamed anyway, the 122B should pay much less than 1.45x for Q8 (section 18).
+
+## 16. Cache-aware routing (opt-in `--fast`, changes the output)
+
+When the expert the model would pick isn't in RAM but a nearly-as-good one is, use the one in RAM. It is implemented
+as a hook just before llama.cpp's top-k expert pick (`llama_set_moe_select_hook`): experts in the cache get their
+router score multiplied by (1 + bonus), which only changes *which* experts are picked. The weights that mix the
+chosen experts still come from the real scores. It applies only while generating (batches of 16 tokens or fewer),
+not to prompt reading. `MOE_CACHE_BONUS=b`.
+
+Quality and disk reads: 35B Q5 with a 2.7 GB expert cache (the 8 GB laptop plan), WikiText-2 4 x 512 tokens fed one
+token at a time (`-ub 1`, so the cache state is what it would be while chatting), KL divergence against the same
+setup without the bonus (logs: `results/route/` on the PC, `pc/route-sweep.ps1`):
+
+| Bonus | Expert data read | Picks switched | Same top token | Mean KLD |
+|---|---|---|---|---|
+| none | 100% | 0% | 100% | 0 |
+| 0.1 | 89% | 4.9% | 96.5% | 0.010 |
+| 0.25 | 78% | 9.9% | 95.2% | 0.016 |
+| 0.5 | 68% | 14.5% | 94.0% | 0.023 |
+| **1.0** | **61%** | 18.0% | 93.1% | **0.029** |
+| 2.0 | 57% | 20.1% | 92.2% | 0.038 |
+
+For comparison, using 7 of 8 experts (section 13, measured on the 122B) saves 12.5% of reads at KLD 0.033.
+Routing with bonus 1.0 saves 39% at 0.029, so it is the better way to trade a little quality for speed. The PC SSD
+wait time dropped in step: 216 s -> 92 s for the 2,048 tokens. `--fast` uses bonus 1.0.
+
+Keeping the model's own top-ranked pick regardless (`MOE_CACHE_PROTECT=1`) changed almost nothing (bonus 1.0:
+KLD 0.028 vs 0.029, same reads). The top pick is rarely the one that gets switched, so the plain bonus stays.
+
+Prior art note: colibri (github.com/JustVugg/colibri) deliberately never changes routing. Here it is opt-in and the
+app says the answers will differ.
+
+## 17. Slim mode: a model needs ~1x its size on disk, not 2x
+
+Packing keeps a second copy of the experts laid out for fast reads. Slim mode frees the original file's copy of the
+experts once they are packed, by punching holes in the file (`sparse.py`: `fallocate(PUNCH_HOLE)` on Linux,
+`F_PUNCHHOLE` on macOS, `FSCTL_SET_SPARSE` + `FSCTL_SET_ZERO_DATA` on Windows). The file keeps its size and layout, so
+llama.cpp still loads it, and the freed ranges read back as zeros. Packing works one layer at a time: build the
+layer, write it and fsync, read back a sample and compare, then free that layer in the original and record it in
+`<out>.progress`, so an interrupted setup resumes instead of losing data. Peak disk use is the model plus one layer.
+
+The engine must then never read experts from the original file. The one path that did (an expert that doesn't fit a
+small cache during a big prompt op, the "overflow" fallback) now points llama.cpp into a read-only mapping of the
+packed file instead.
+
+Test (VM, 35B Q5, `vm/slim-test.sh`): re-packed through the app with `--slim`. The model file went from 25 GB to 3 GB on
+disk, and the packed copy is 22 GB, so the model uses ~25 GB instead of ~47. A fixed prompt with greedy sampling gave
+byte-identical answers before and after slimming, with a 6 GB cache and with a 0.3 GB cache (12 experts overflowed
+and were read through the packed mapping). The app slims models it downloaded itself automatically; a model file
+the user brought is only slimmed with `--slim`.
+
 ## What didn't work, and why
 
 - **Windows PrefetchVirtualMemory called inline** made things 3× slower (it blocks while walking the range). Moving

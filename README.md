@@ -14,7 +14,7 @@ laptop gets about half this speed (see the table below).*
 
 ## Download
 
-Get the zip for your computer from [Releases](../../releases/latest), unzip it, and double-click `moe`.
+Get the zip for your computer from [Releases](../../releases/latest), unzip it, and double-click `stowaway`.
 Pick a model; it shows the download size and asks before downloading anything. After a one-time setup, a chat opens
 in your browser.
 
@@ -23,16 +23,19 @@ in your browser.
 | Qwen3.5-35B-A3B Q5 (26 GB download) | ~5-6 words per second |
 | Qwen3.5-122B-A10B Q5 (92 GB download) | ~1 word per second |
 
-You need an SSD and about twice the model's size in free disk space. From a terminal:
+You need an SSD and about the model's size in free disk space, plus 10%. From a terminal:
 
 ```
-moe list                      models it can download
-moe run qwen3.5-35b           download (asks first), set up, chat in the browser
-moe run qwen3.5-35b --cli     chat in the terminal
-moe run qwen3.5-35b --think   let the model think before answering (off by default: slow on slow machines)
-moe plan qwen3.5-122b         show the memory plan and expected speed
-moe run path/to/model.gguf    any other Mixture-of-Experts GGUF model
+stowaway list                      models it can download
+stowaway run qwen3.5-35b           download (asks first), set up, chat in the browser
+stowaway run qwen3.5-35b --cli     chat in the terminal
+stowaway run qwen3.5-35b --fast    ~40% less reading from disk; answers differ slightly (see below)
+stowaway run qwen3.5-35b --think   let the model think before answering (off by default: slow on slow machines)
+stowaway plan qwen3.5-122b         show the memory plan and expected speed
+stowaway run path/to/model.gguf    any other Mixture-of-Experts GGUF model (add --slim to halve its disk use)
 ```
+
+For a step-by-step walkthrough for non-technical people, see the setup guide (ask Aditya for the link).
 
 Windows says "Windows protected your PC" the first time: click More info, then Run anyway. On a Mac, if it
 won't open, run `xattr -dr com.apple.quarantine .` in the unzipped folder. Linux needs glibc 2.34+ and an
@@ -50,8 +53,33 @@ words ahead so each pass over the weights produces several words.
 Speed comes down to drive speed divided by the bytes read per word. All the measurements, including the ideas that
 didn't work, are in [RESULTS.md](RESULTS.md).
 
+Setup packs the experts once into a file laid out for fast reads. For models stowaway downloads, the model file's
+own copy of the experts is freed as it goes (the file keeps its size but the space is released), so a model needs
+about its own size on disk instead of twice.
+
+`--fast` turns on cache-aware routing: when the expert the model wants isn't in memory but a nearly-as-good one is,
+it uses that one. On the 8 GB setup this reads 39% less from disk, at a quality cost smaller than using 7 of the 8
+experts (RESULTS.md section 16). It's off by default because the answers change slightly.
+
 The cache never changes the output: it's bit-identical to plain llama.cpp. Guessing ahead is the same model at the
 same quality, but llama.cpp's batched check rounds slightly differently, so an occasional word can differ.
+
+## Related work
+
+Streaming Mixture-of-Experts weights from storage is not a new idea, and this project builds on others' work:
+
+- [colibri](https://github.com/JustVugg/colibri): a pure-C engine that streams experts from NVMe to run
+  744B-2.8T models on machines from ~25 GB of RAM up, with a hardware planner and MTP speculation. It targets the
+  biggest models; stowaway targets the smallest machines (8 GB, no GPU) with standard GGUF files at Q5-Q8.
+- [llama.cpp PR #25294](https://github.com/ggml-org/llama.cpp/pull/25294) (stream MoE experts from disk) and
+  [Hypura](https://github.com/ggml-org/llama.cpp/discussions/20852) (GPU/RAM/NVMe placement on Macs).
+- Research: *LLM in a flash* (Apple, 2023: running models larger than DRAM from flash, bundling weights for bigger
+  reads), *Fast Inference of Mixture-of-Experts Language Models with Offloading* (Eliseev & Mazur, 2023: LRU expert
+  cache, speculative expert loading), *Pre-gated MoE* (ISCA 2024: predicting the next layer's experts), and work on
+  cache-aware expert selection.
+
+What stowaway adds: an 8 GB target with measured results, streaming the always-needed weights too when they don't
+fit, opt-in cache-aware routing with measured quality cost, slim packing, and a one-click app.
 
 ## Build from source
 
@@ -59,7 +87,7 @@ same quality, but llama.cpp's batched check rounds slightly differently, so an o
 ./setup-llama.sh            # clones llama.cpp at d2e5458 and applies patches/moe-stream.patch
 cmake -S llama.cpp -B llama.cpp/build -DCMAKE_BUILD_TYPE=Release && cmake --build llama.cpp/build -j --target llama-cli llama-server
 pip install numpy pyyaml
-python moe.py list
+python moe.py list          # the app is moe.py; release builds name it stowaway
 ```
 
 The release builds use `pc/build-dist.ps1` (Windows), `vm/build-dist.sh` (Linux, Ubuntu 22.04) and the Mac recipe

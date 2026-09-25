@@ -31,10 +31,10 @@ index d8319cd..7eb83f7 100644
      }
 diff --git a/common/moe-stream.h b/common/moe-stream.h
 new file mode 100644
-index 0000000..deb7d67
+index 0000000..a050f76
 --- /dev/null
 +++ b/common/moe-stream.h
-@@ -0,0 +1,1704 @@
+@@ -0,0 +1,1836 @@
 +// moe-stream: run Mixture-of-Experts models that are much bigger than RAM (moe-router-study).
 +//
 +// - expert_cache: keeps recently used experts in a fixed block of RAM and reads missing ones straight from the model
@@ -49,6 +49,7 @@ index 0000000..deb7d67
 +#include "ggml.h"
 +#include "ggml-cpu.h"
 +#include "gguf.h"
++#include "llama.h"
 +
 +#include <algorithm>
 +#include <atomic>
@@ -664,6 +665,52 @@ index 0000000..deb7d67
 +        return data_off;
 +    }
 +
++    // Overflow fallback: when the cache has no free slot for an expert (a prompt op can need more experts than a
++    // small cache holds), point llama.cpp at the expert inside the packed file through a read-only mapping, so the OS
++    // pages it in. Never the original model file: in slim mode (stowaway) its expert data has been removed.
++    std::vector<char *> fb_views;
++    static char * map_readonly(const std::string & f) {
++#ifdef _WIN32
++        HANDLE h = CreateFileA(f.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
++        if (h == INVALID_HANDLE_VALUE) {
++            return nullptr;
++        }
++        HANDLE m = CreateFileMappingA(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
++        CloseHandle(h);
++        char * v = m ? (char *) MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0) : nullptr;
++        if (m) {
++            CloseHandle(m);
++        }
++        return v;
++#else
++        const int fd = open(f.c_str(), O_RDONLY);
++        if (fd < 0) {
++            return nullptr;
++        }
++        const size_t len = (size_t) lseek(fd, 0, SEEK_END);
++        void * v = mmap(nullptr, len, PROT_READ, MAP_SHARED, fd, 0);
++        close(fd);
++        return v == MAP_FAILED ? nullptr : (char *) v;
++#endif
++    }
++    const void * fallback_ptr(const tensor_info * info, int expert) {
++        if (!packed) {
++            return nullptr; // unpacked: llama.cpp's own mapping of the model file is the right place
++        }
++        const tensor_info * u = unit(info);
++        if ((int) fb_views.size() <= u->file) {
++            fb_views.resize(u->file + 1, nullptr);
++        }
++        if (!fb_views[u->file]) {
++            fb_views[u->file] = map_readonly(paths[u->file]);
++            if (!fb_views[u->file]) {
++                fprintf(stderr, "expert-cache: could not map %s for the overflow fallback\n", paths[u->file].c_str());
++                return nullptr;
++            }
++        }
++        return fb_views[u->file] + u->offset + (size_t) expert * u->per_expert + info->part_off;
++    }
++
 +    // where to read expert e of t from
 +    void locate(const tensor_info * t, int e, int * file, size_t * start) {
 +        if (t->file2 >= 0 && e % stripe_mod == stripe_rem) {
@@ -751,6 +798,12 @@ index 0000000..deb7d67
 +    std::condition_variable cv_work, cv_done;
 +
 +    ~expert_cache() {
++        if (getenv("MOE_STATS") && (hits + misses)) {
++            print_stats();
++        }
++        if (route_bonus > 0.0f) {
++            llama_set_moe_select_hook(nullptr, nullptr);
++        }
 +        {
 +            std::lock_guard<std::mutex> lock(mtx);
 +            stopping = true;
@@ -1195,7 +1248,7 @@ index 0000000..deb7d67
 +            entry * e = ensure(unit(info), experts[i], protect, todo, &present);
 +            present ? hits++ : misses++;
 +            if (!e) {
-+                ptrs[i] = nullptr; // no room: llama.cpp reads it from the model file as usual
++                ptrs[i] = fallback_ptr(info, experts[i]); // no room: read it through the packed file's mapping
 +                continue;
 +            }
 +            protect.insert(e->slot);
@@ -1422,6 +1475,69 @@ index 0000000..deb7d67
 +        }
 +    }
 +
++    // ---- cache-aware routing (MOE_CACHE_BONUS): while generating, experts already in RAM get their router score
++    // multiplied by (1 + bonus) before the top-k pick, so a near-tie goes to the one that needs no disk read. The
++    // chosen experts' weights still come from the real scores (llama_set_moe_select_hook). Changes the output. ----
++    float  route_bonus = 0.0f;
++    int    route_max_tokens = 16;  // only per-token steps (and small verify batches), not whole prompts
++    int    route_protect = 0;      // the model's own top-N picks are never swapped out (MOE_CACHE_PROTECT)
++    size_t route_picks = 0, route_swaps = 0;
++    std::vector<int32_t> route_a, route_b;
++
++    bool resident(int layer, int expert) {
++        auto it = by_layer.find(layer);
++        if (it == by_layer.end()) {
++            return false;
++        }
++        for (const tensor_info * t : it->second) {
++            if (index.find({ t, expert }) == index.end()) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    void rerank(float * scores, int n_expert, int n_tok, int k, int layer) {
++        if (route_bonus <= 0.0f || n_tok > route_max_tokens || k <= 0 || k >= n_expert || !by_layer.count(layer)) {
++            return;
++        }
++        route_a.resize(n_expert);
++        route_b.resize(n_expert);
++        const int protect = std::min(route_protect, k);
++        int32_t keep[16];
++        auto top = [&](const float * v, std::vector<int32_t> & idx, int32_t * best) {
++            for (int e = 0; e < n_expert; e++) idx[e] = e;
++            std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int32_t x, int32_t y) { return v[x] > v[y]; });
++            for (int i = 0; best && i < protect && i < 16; i++) best[i] = idx[i];
++            std::sort(idx.begin(), idx.begin() + k);
++        };
++        for (int r = 0; r < n_tok; r++) {
++            float * v = scores + (size_t) r * n_expert;
++            top(v, route_a, keep);
++            for (int e = 0; e < n_expert; e++) {
++                if (resident(layer, e)) {
++                    v[e] *= 1.0f + route_bonus;
++                }
++            }
++            for (int i = 0; i < protect && i < 16; i++) {
++                v[keep[i]] = 1e30f; // ranking only; the weight still comes from the real score
++            }
++            top(v, route_b, nullptr);
++            int same = 0;
++            for (int i = 0, j = 0; i < k && j < k;) {
++                if (route_a[i] == route_b[j]) { same++; i++; j++; }
++                else if (route_a[i] < route_b[j]) i++;
++                else j++;
++            }
++            route_picks += k;
++            route_swaps += k - same;
++        }
++    }
++
++    static void select_hook(float * scores, int n_expert, int n_tok, int k, int layer, void * ud) {
++        ((expert_cache *) ud)->rerank(scores, n_expert, n_tok, k, layer);
++    }
++
 +    void print_stats() const {
 +        const size_t total = hits + misses;
 +        fprintf(stderr, "expert-cache: %zu lookups, %.1f%% already in RAM or loading, %zu loaded ahead for the next op, "
@@ -1431,6 +1547,10 @@ index 0000000..deb7d67
 +            fprintf(stderr, "expert-cache: guesses: %zu loaded, %zu wrong (demoted or cancelled), %zu skipped (cache too full of recent experts), "
 +                            "%zu reads promoted to urgent\n", pregated, spec_wrong, spec_skipped, spec_promoted);
 +        }
++        if (route_picks) {
++            fprintf(stderr, "expert-cache: cache-aware routing (bonus %.2f): %zu of %zu expert picks switched to one already in RAM (%.1f%%)\n",
++                    route_bonus, route_swaps, route_picks, 100.0 * route_swaps / route_picks);
++        }
 +        fprintf(stderr, "expert-cache: %zu needed experts were still loading when asked for (%.1f%% of lookups)\n",
 +                late, total ? 100.0 * late / total : 0.0);
 +        if (dstream_on) {
@@ -1439,7 +1559,8 @@ index 0000000..deb7d67
 +                    dstream_layer_loads, dstream_misses, dstream_bytes / 1e9, dstream_wait_s);
 +        }
 +        if (overflow) {
-+            fprintf(stderr, "expert-cache: %zu experts didn't fit and were read from the model file directly\n", overflow);
++            fprintf(stderr, "expert-cache: %zu experts didn't fit in the cache and were read through the %s file's mapping\n",
++                    overflow, packed ? "packed" : "model");
 +        }
 +        if (n_reads) {
 +            fprintf(stderr, "expert-cache: reads: %zu, avg %.2f ms each (%.0f MB/s per read), up to %zu at once; "
@@ -1727,6 +1848,17 @@ index 0000000..deb7d67
 +        fprintf(stderr, "moe-stream: could not start; running without it\n");
 +        return false;
 +    }
++    if (const char * b = getenv("MOE_CACHE_BONUS")) {
++        cache.route_bonus = (float) atof(b);
++        if (const char * pr = getenv("MOE_CACHE_PROTECT")) {
++            cache.route_protect = atoi(pr);
++        }
++        if (cache.route_bonus > 0.0f) {
++            llama_set_moe_select_hook(expert_cache::select_hook, &cache);
++            fprintf(stderr, "moe-stream: cache-aware routing on (experts in RAM get a %.0f%% score bonus, top %d picks kept; "
++                            "changes the output)\n", 100.0 * cache.route_bonus, cache.route_protect);
++        }
++    }
 +    const char * m = getenv("MOE_PREGATE");
 +    if (m && atoi(m) > 0 && pg.load(model_path)) {
 +        pg.m     = atoi(m);
@@ -1856,6 +1988,71 @@ index 8bb0ff7..22ca417 100644
              } break;
          case GGML_OP_MUL_MAT_ID:
              {
+diff --git a/include/llama.h b/include/llama.h
+index 31bbf8b..5a4b516 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1029,6 +1029,12 @@ extern "C" {
+     // Set abort callback
+     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
+ 
++    // moe-stream: called with each MoE layer's expert scores ([n_expert] floats per token, before the top-k pick) so
++    // the ranking can be adjusted in place, e.g. to prefer experts already in RAM. Only the pick changes: the chosen
++    // experts' weights still come from the unmodified scores. Must be set before contexts are created. nullptr = off.
++    typedef void (*llama_moe_select_hook)(float * scores, int n_expert, int n_tokens, int n_expert_used, int il, void * user_data);
++    LLAMA_API void llama_set_moe_select_hook(llama_moe_select_hook hook, void * user_data);
++
+     // Wait until all computations are finished
+     // This is automatically done when using one of the functions below to obtain the computation results
+     // and is not necessary to call it explicitly in most cases
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 07ca49a..29e056f 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1946,6 +1946,29 @@ ggml_tensor * llm_graph_context::build_ffn(
+     return cur;
+ }
+ 
++// moe-stream selection hook (see llama_set_moe_select_hook)
++static llama_moe_select_hook g_moe_select_hook      = nullptr;
++static void *                g_moe_select_hook_data = nullptr;
++static int                   g_moe_n_expert_used    = 0;
++
++void llama_set_moe_select_hook(llama_moe_select_hook hook, void * user_data) {
++    g_moe_select_hook      = hook;
++    g_moe_select_hook_data = user_data;
++}
++
++static void moe_select_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
++    (void) nth;
++    if (ith != 0) {
++        return;
++    }
++    GGML_ASSERT(a->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
++    memcpy(dst->data, a->data, ggml_nbytes(a));
++    if (g_moe_select_hook) {
++        g_moe_select_hook((float *) dst->data, (int) a->ne[0], (int) ggml_nrows(a), g_moe_n_expert_used,
++                          (int) (intptr_t) userdata, g_moe_select_hook_data);
++    }
++}
++
+ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * cur,
+          ggml_tensor * gate_inp,
+@@ -2067,6 +2090,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(selection_probs, "ffn_moe_probs_biased", il);
+     }
+ 
++    // moe-stream: let the hook re-rank experts (the weights below still come from the unbiased probs)
++    if (g_moe_select_hook != nullptr && selected_experts_in == nullptr) {
++        g_moe_n_expert_used = (int) n_expert_used;
++        selection_probs = ggml_map_custom1(ctx0, ggml_cont(ctx0, selection_probs), moe_select_op, 1, (void *) (intptr_t) il);
++        cb(selection_probs, "ffn_moe_probs_hooked", il);
++    }
++
+     // llama4 doesn't have exp_probs_b, and sigmoid is only used after top_k
+     // see: https://github.com/meta-llama/llama-models/blob/699a02993512fb36936b1b0741e13c06790bcf98/models/llama4/moe.py#L183-L198
+     if (arch == LLM_ARCH_LLAMA4) {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 index e195f50..d6656cc 100644
 --- a/src/llama-model.cpp

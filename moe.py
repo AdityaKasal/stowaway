@@ -1,14 +1,16 @@
-"""moe: run big Mixture-of-Experts language models on ordinary computers - no GPU, little RAM.
+"""stowaway: run big Mixture-of-Experts language models on ordinary computers - no GPU, little RAM.
 
-    moe list                          models it can download for you
-    moe run qwen3.5-35b               download (asks first), set up once, chat in your browser
-    moe run path/to/model.gguf        or run a MoE model you already have
-    moe run qwen3.5-122b --cli        chat in the terminal instead
-    moe run qwen3.5-35b -p "Hi"       answer one prompt and exit
-    moe plan qwen3.5-122b             show the memory plan and expected speed, then stop
+    stowaway list                     models it can download for you
+    stowaway run qwen3.5-35b          download (asks first), set up once, chat in your browser
+    stowaway run path/to/model.gguf   or run a MoE model you already have
+    stowaway run qwen3.5-122b --cli   chat in the terminal instead
+    stowaway run qwen3.5-35b --fast   ~1.5x less reading from disk; answers differ slightly from the full model
+    stowaway run qwen3.5-35b -p "Hi"  answer one prompt and exit
+    stowaway plan qwen3.5-122b        show the memory plan and expected speed, then stop
 
-It checks free RAM and drive speed, packs the model's experts once (a second copy laid out for fast reads, so a model
-needs about twice its size in disk space), sizes the caches to fit, and starts llama.cpp with moe-stream turned on.
+It checks free RAM and drive speed, packs the model's experts once (a copy laid out for fast reads; for models it
+downloaded, the model file's own copy of the experts is freed as it goes, so a model needs about its own size on disk),
+sizes the caches to fit, and starts llama.cpp with moe-stream turned on.
 """
 
 import argparse
@@ -209,14 +211,20 @@ def ensure_dense_packed(info, dense_packed):
     pack_dense.pack(info["parts"][0], dense_packed)
 
 
-def ensure_packed(info, packed):
-    if Path(f"{packed}.idx").exists() and Path(f"{packed}.bin").exists():
+def ensure_packed(info, packed, slim):
+    """Pack the experts once. slim: free the original file's copy of them layer by layer (the model then needs ~1x
+    its size on disk instead of 2x); only for models stowaway downloaded itself, or when asked with --slim."""
+    if Path(f"{packed}.idx").exists() and Path(f"{packed}.bin").exists() and not Path(f"{packed}.progress").exists():
         return
+    resuming = Path(f"{packed}.progress").exists()
     free = shutil.disk_usage(Path(packed).parent).free / GB
-    if free < info["expert_gb"] + 5:
-        sys.exit(f"packing needs {info['expert_gb']:.0f} GB free next to the model; only {free:.0f} GB free")
-    print(f"one-time setup: packing {info['expert_gb']:.1f} GB of experts for fast reads (a few minutes)...", flush=True)
-    repack_experts.repack(info["parts"][0], packed)
+    need = (info["expert_gb"] / max(info["layers"], 1) * 1.2 + 2) if slim else info["expert_gb"] + 5
+    if free < need and not resuming:
+        sys.exit(f"packing needs {need:.0f} GB free next to the model; only {free:.0f} GB free")
+    print(f"one-time setup: packing {info['expert_gb']:.1f} GB of experts for fast reads (a few minutes)"
+          + ("; the model's own copy of them is freed as it goes, so it won't need twice the space" if slim else "")
+          + "...", flush=True)
+    repack_experts.repack(info["parts"][0], packed, slim=slim)
 
 
 # ---------------------------------------------------------------- models it can download
@@ -261,7 +269,7 @@ def download(url, dst):
     part = Path(str(dst) + ".part")
     for attempt in range(20):
         have = part.stat().st_size if part.exists() else 0
-        req = urllib.request.Request(url, headers={"Range": f"bytes={have}-", "User-Agent": "moe/1.0"})
+        req = urllib.request.Request(url, headers={"Range": f"bytes={have}-", "User-Agent": "stowaway/1.1"})
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
                 total = have + int(r.headers.get("Content-Length", 0))
@@ -299,10 +307,10 @@ def fetch(entry, into, assume_yes, what):
     if not missing:
         return paths[0]
     free = shutil.disk_usage(models_dir()).free / GB
-    need = entry["gb"] * (2.05 if what == "model" else 1.0)  # a model also needs room for its packed copy
+    need = entry["gb"] * (1.1 if what == "model" else 1.0)  # packing frees the original's copy as it goes (slim)
     print(f"{what}: {entry['repo']} ({entry['gb']:.1f} GB download from huggingface.co)")
     if what == "model":
-        print(f"  needs ~{need:.0f} GB of disk in {into} (the model plus its packed copy); {free:.0f} GB free")
+        print(f"  needs ~{need:.0f} GB of disk in {into}; {free:.0f} GB free")
     if free < need:
         sys.exit(f"not enough disk space in {into}: need ~{need:.0f} GB, have {free:.0f} GB "
                  f"(set MOE_HOME to a folder on a bigger drive)")
@@ -319,28 +327,28 @@ def resolve_model(name, assume_yes, plan_only=False):
         e, into = CATALOG[name], models_dir() / name
         if plan_only and not all((into / Path(f).name).exists() for f in e["files"]):
             free = shutil.disk_usage(models_dir()).free / GB
-            sys.exit(f"{name} isn't downloaded yet: {e['gb']:.1f} GB download, needs ~{e['gb'] * 2.05:.0f} GB of disk "
-                     f"({free:.0f} GB free in {models_dir()}).\n{e['about']}\nget it with: moe run {name}")
+            sys.exit(f"{name} isn't downloaded yet: {e['gb']:.1f} GB download, needs ~{e['gb'] * 1.1:.0f} GB of disk "
+                     f"({free:.0f} GB free in {models_dir()}).\n{e['about']}\nget it with: stowaway run {name}")
         return fetch(e, into, assume_yes, "model")
     p = Path(name)
     if p.exists():
         return p
-    sys.exit(f"'{name}' is neither a file nor a known model; try 'moe list'")
+    sys.exit(f"'{name}' is neither a file nor a known model; try 'stowaway list'")
 
 
 def cmd_list():
-    print("models moe can download and run:\n")
+    print("models stowaway can download and run:\n")
     for name, e in CATALOG.items():
         here = (models_dir() / name / Path(e["files"][0]).name).exists()
         print(f"  {name:14s} {e['gb']:5.1f} GB  {'(downloaded) ' if here else ''}{e['about']}")
     print(f"\nmodels are stored in {models_dir()} (set MOE_HOME to change)")
-    print("any other Mixture-of-Experts GGUF file works too: moe run path/to/model.gguf")
+    print("any other Mixture-of-Experts GGUF file works too: stowaway run path/to/model.gguf")
 
 
 def menu():
     """What you get when you double-click moe: pick a model and chat, no typing commands."""
     names = list(CATALOG)
-    print("moe - run big AI models on an ordinary computer\n")
+    print("stowaway - run big AI models on an ordinary computer\n")
     for i, name in enumerate(names, 1):
         e = CATALOG[name]
         here = (models_dir() / name / Path(e["files"][0]).name).exists()
@@ -374,12 +382,14 @@ def main(argv=None):
     cmd = "run"
     if argv[0] in ("run", "plan"):
         cmd = argv.pop(0)
-    ap = argparse.ArgumentParser(prog=f"moe {cmd}")
-    ap.add_argument("model", help="a model name from 'moe list', or a path to a .gguf file")
+    ap = argparse.ArgumentParser(prog=f"stowaway {cmd}")
+    ap.add_argument("model", help="a model name from 'stowaway list', or a path to a .gguf file")
     ap.add_argument("--cli", action="store_true", help="chat in the terminal instead of the browser")
     ap.add_argument("-p", "--prompt", help="answer one prompt and exit")
     ap.add_argument("-n", type=int, default=512, help="max tokens per answer (default 512)")
     ap.add_argument("--plan", action="store_true", help="only print the plan")
+    ap.add_argument("--fast", action="store_true", help="prefer experts already in memory when the model's choice is "
+                    "close (about 1.5x less reading from disk; answers differ slightly from the full model)")
     ap.add_argument("--think", action="store_true", help="let the model think out loud before answering (better on hard "
                     "questions, but on a slow machine it can take minutes before the answer starts)")
     ap.add_argument("-y", "--yes", action="store_true", help="don't ask before downloading")
@@ -388,6 +398,8 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--bin", help="folder with llama-server / llama-cli (default: next to moe)")
     ap.add_argument("--packed", help="existing packed experts (path without .bin/.idx)")
+    ap.add_argument("--slim", action="store_true", help="when packing, free the model file's own copy of the experts "
+                    "(halves disk use; the .gguf then only works with stowaway). Automatic for models stowaway downloaded")
     ap.add_argument("--experts", type=int, help="use this many experts per token instead of the model's own number "
                     "(faster on slow drives, but CHANGES the answers)")
     ap.add_argument("--draft", help="small helper model for guessing ahead ('none' to disable)")
@@ -401,7 +413,7 @@ def run(args):
     model_path = resolve_model(args.model, args.yes, args.plan)
     info = model_info(model_path)
     if not info["experts"]:
-        sys.exit("this isn't a Mixture-of-Experts model; moe only helps with MoE models")
+        sys.exit("this isn't a Mixture-of-Experts model; stowaway only helps with MoE models")
     fewer = args.experts and 0 < args.experts < info["k"]
     if fewer:
         info["active_expert_gb"] *= args.experts / info["k"]
@@ -446,14 +458,20 @@ def run(args):
     if fewer:
         print(f"quality: using {args.experts} of {info['k']} experts per token - faster, but answers will differ "
               f"from the full model")
+    if args.fast:
+        print("fast:    prefers experts already in memory when the model's choice is close - about 40% less reading "
+              "from disk; answers differ slightly from the full model (same top word ~93% of the time)")
     if args.plan:
         return
 
-    ensure_packed(info, packed)
+    slim = args.slim or models_dir() in first.resolve().parents
+    ensure_packed(info, packed, slim)
     env = dict(os.environ,
                MOE_CACHE_GB=f"{plan['cache_gb']:.2f}", MOE_IO_THREADS="4", MOE_PREGATE=str(plan["pregate"]),
                EXPERT_CACHE_PACKED=str(packed), EXPERT_CACHE_CHUNK_KB="8192", LLAMA_NO_MMAP_PREFETCH="1",
                CUDA_VISIBLE_DEVICES=os.environ.get("CUDA_VISIBLE_DEVICES", "-1"))
+    if args.fast:
+        env["MOE_CACHE_BONUS"] = "1.0"  # cache-aware routing; measured: -39% expert reads, KLD 0.029 (RESULTS.md)
     if plan["dense_stream_gb"]:
         ensure_dense_packed(info, dense_packed)
         env["EXPERT_CACHE_DENSE_GB"] = f"{plan['dense_stream_gb']:.2f}"
