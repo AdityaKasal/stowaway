@@ -1,0 +1,5 @@
+# first prompt doubles as a warmup; compare the later ones
+chat	Give me three tips for staying focused while studying.
+code	Write a Python function that checks whether a string is a valid palindrome, ignoring punctuation and case.
+facts	Explain how a lithium-ion battery works, and why they degrade over time.
+creative	Write a short poem about a city built inside a canyon.

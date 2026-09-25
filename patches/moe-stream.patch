@@ -1,0 +1,1873 @@
+diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
+index 2b307c5..6aab2e7 100644
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -184,3 +184,4 @@ if (LLAMA_LLGUIDANCE)
+ endif()
+ 
+ target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
++target_link_libraries(${TARGET} PRIVATE ggml-cpu) # moe-stream.h installs hooks in the CPU backend
+diff --git a/common/common.cpp b/common/common.cpp
+index d8319cd..7eb83f7 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "build-info.h"
+ #include "common.h"
++#include "moe-stream.h"
+ #include "fit.h"
+ #include "log.h"
+ #include "llama.h"
+@@ -1327,6 +1328,9 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+     }
+ 
+     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
++    if (model != NULL) {
++        moe_stream_start_from_env(params.model.path); // moe-router-study: off unless MOE_CACHE_GB is set
++    }
+     if (model == NULL) {
+         return;
+     }
+diff --git a/common/moe-stream.h b/common/moe-stream.h
+new file mode 100644
+index 0000000..deb7d67
+--- /dev/null
++++ b/common/moe-stream.h
+@@ -0,0 +1,1704 @@
++// moe-stream: run Mixture-of-Experts models that are much bigger than RAM (moe-router-study).
++//
++// - expert_cache: keeps recently used experts in a fixed block of RAM and reads missing ones straight from the model
++//   file (or a packed copy, optionally split across two drives), in parallel, bypassing the OS file cache.
++// - dense streaming: the same for the always-needed weights when even those don't fit (EXPERT_CACHE_DENSE_GB).
++// - pregate: predicts the next layer's experts with its router and loads them early.
++// Plugs into llama.cpp through ggml_cpu_set_expert_hook / ggml_cpu_set_weight_hook (our ggml-cpu patch).
++//
++// Any llama.cpp program built with common/ turns it on from environment variables; see moe_stream_start_from_env.
++#pragma once
++
++#include "ggml.h"
++#include "ggml-cpu.h"
++#include "gguf.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <fstream>
++#include <functional>
++#include <list>
++#include <map>
++#include <set>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <unordered_set>
++#include <vector>
++
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <windows.h>
++#else
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#endif
++
++struct expert_cache {
++    static constexpr size_t ALIGN = 4096; // unbuffered reads need sector-aligned offsets, sizes and buffers
++
++    struct tensor_info {
++        int    layer;
++        int    file;
++        size_t offset;     // file offset of expert 0
++        size_t per_expert; // bytes per expert
++        std::vector<const tensor_info *> siblings; // the layer's other expert tensors (gate/up/down use the same experts)
++        // packed mode (EXPERT_CACHE_PACKED): all of a layer's expert tensors share one block per expert
++        const tensor_info * block = nullptr;   // the cache unit this tensor lives in (nullptr = itself)
++        size_t part_off = 0;                   // where this tensor's data sits inside the block
++        int    file2 = -1;                     // striped mode: copies of some experts on a second drive
++        size_t offset2 = 0;
++        size_t split = 0;                      // tail mode: bytes [split, end) of every expert come from file3
++        int    file3 = -1;
++        size_t offset3 = 0;
++    };
++    int stripe_mod = 0, stripe_rem = 0;        // expert e is read from the second drive when e % mod == rem
++    size_t stripe_reads = 0;
++
++    struct job;
++
++    // ---- always-needed ("dense") weights: attention, shared experts, norms, output layer ----
++    // llama.cpp reads these through its own mmap. On a machine that can't hold them all, the OS evicts them in the
++    // wrong order (they're used in a fixed cycle) and faults them back in small pieces. We map the same files and
++    // (a) ask the OS to read the next layers' weights ahead in big chunks, (b) optionally lock some in RAM.
++    struct range { int file; size_t off; size_t len; std::string name; };
++    std::map<int, std::vector<range>> dense_by_layer;  // layer -> its non-expert tensors; -1 = output layer etc.
++    int dense_packed_file = -1;                         // EXPERT_CACHE_DENSE_PACKED (pack_dense.py): one read per layer
++    std::string dense_packed_path;
++    std::vector<char *> views;                         // read-only mapping of each model split
++    std::vector<size_t> view_len;
++    bool dense_prefetch = false;
++    int  dense_ahead = 2;
++    int  n_model_layers = 0;
++    int  last_dense_layer = -1;
++    size_t dense_pinned = 0, dense_prefetches = 0;
++    std::thread dense_worker;
++    std::deque<std::vector<range>> dense_queue;
++    std::mutex dense_mtx;
++    std::condition_variable dense_cv;
++    bool dense_stop = false;
++
++    bool map_views(const std::vector<std::string> & files) {
++        for (const auto & f : files) {
++#ifdef _WIN32
++            HANDLE h = CreateFileA(f.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
++            if (h == INVALID_HANDLE_VALUE) {
++                return false;
++            }
++            LARGE_INTEGER sz;
++            GetFileSizeEx(h, &sz);
++            HANDLE m = CreateFileMappingA(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
++            CloseHandle(h);
++            char * v = m ? (char *) MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0) : nullptr;
++            if (m) {
++                CloseHandle(m);
++            }
++            views.push_back(v);
++            view_len.push_back((size_t) sz.QuadPart);
++#else
++            const int fd = open(f.c_str(), O_RDONLY);
++            if (fd < 0) {
++                return false;
++            }
++            const size_t len = (size_t) lseek(fd, 0, SEEK_END);
++            void * v = mmap(nullptr, len, PROT_READ, MAP_SHARED, fd, 0);
++            close(fd);
++            views.push_back(v == MAP_FAILED ? nullptr : (char *) v);
++            view_len.push_back(len);
++#endif
++            if (!views.back()) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    void dense_advise(const std::vector<range> & rs) {
++#ifdef _WIN32
++        std::vector<WIN32_MEMORY_RANGE_ENTRY> e;
++        for (const auto & r : rs) {
++            e.push_back({ (PVOID) (views[r.file] + r.off), r.len });
++        }
++        if (!e.empty()) {
++            PrefetchVirtualMemory(GetCurrentProcess(), e.size(), e.data(), 0);
++        }
++#else
++        for (const auto & r : rs) {
++            const size_t pg = 16384;
++            char * a = (char *) ((uintptr_t) (views[r.file] + r.off) & ~(uintptr_t) (pg - 1));
++            madvise(a, (views[r.file] + r.off + r.len) - a, MADV_WILLNEED);
++        }
++#endif
++    }
++
++    void dense_loop() {
++        for (;;) {
++            std::vector<range> rs;
++            {
++                std::unique_lock<std::mutex> lock(dense_mtx);
++                dense_cv.wait(lock, [&] { return dense_stop || !dense_queue.empty(); });
++                if (dense_stop) {
++                    return;
++                }
++                rs = std::move(dense_queue.front());
++                dense_queue.pop_front();
++            }
++            dense_advise(rs);
++        }
++    }
++
++    void queue_dense(int layer) {
++        auto it = dense_by_layer.find(layer);
++        if (it == dense_by_layer.end()) {
++            return;
++        }
++        {
++            std::lock_guard<std::mutex> lock(dense_mtx);
++            while (dense_queue.size() > 4) {
++                dense_queue.pop_front(); // stale: those layers already ran
++            }
++            dense_queue.push_back(it->second);
++        }
++        dense_prefetches++;
++        dense_cv.notify_one();
++    }
++
++    // called at the first expert op of each layer: read the next layers' dense weights ahead
++    void on_layer(int layer) {
++        if (!dense_prefetch || layer == last_dense_layer) {
++            return;
++        }
++        last_dense_layer = layer;
++        for (int d = 1; d <= dense_ahead; d++) {
++            const int next = layer + d;
++            if (next < n_model_layers) {
++                queue_dense(next);
++            } else {
++                queue_dense(-1);                              // output layer, used right after the last layer
++                queue_dense(next - n_model_layers);           // the next word's first layers
++            }
++        }
++    }
++
++    // lock dense weights in RAM up to `bytes`: the output layer first (every word uses it), then layers from the end
++    // backwards (the start of each word gets the load-ahead from the previous word's last layers)
++    void pin_dense(size_t bytes) {
++        std::vector<int> order = { -1 };
++        for (int L = n_model_layers - 1; L >= 0; L--) {
++            order.push_back(L);
++        }
++        size_t want = 0;
++        std::vector<range> pick;
++        for (int L : order) {
++            auto it = dense_by_layer.find(L);
++            if (it == dense_by_layer.end()) {
++                continue;
++            }
++            size_t sz = 0;
++            for (const auto & r : it->second) {
++                sz += r.len;
++            }
++            if (want + sz > bytes) {
++                break;
++            }
++            want += sz;
++            pick.insert(pick.end(), it->second.begin(), it->second.end());
++        }
++#ifdef _WIN32
++        SIZE_T mn, mx;
++        GetProcessWorkingSetSize(GetCurrentProcess(), &mn, &mx);
++        SetProcessWorkingSetSizeEx(GetCurrentProcess(), mn + want + ((SIZE_T) 256 << 20), mx + want + ((SIZE_T) 512 << 20),
++                                   QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
++#endif
++        for (const auto & r : pick) {
++            const size_t pg = 65536;
++            char * a = (char *) ((uintptr_t) (views[r.file] + r.off) & ~(uintptr_t) (pg - 1));
++            const size_t len = (views[r.file] + r.off + r.len) - a;
++#ifdef _WIN32
++            if (VirtualLock(a, len)) {
++                dense_pinned += len;
++            }
++#else
++            if (mlock(a, len) == 0) {
++                dense_pinned += len;
++            }
++#endif
++        }
++        fprintf(stderr, "expert-cache: pinned %.2f GB of always-needed weights in RAM\n", dense_pinned / 1e9);
++    }
++
++    // ---- dense streaming (EXPERT_CACHE_DENSE_GB): our own fixed budget for the always-needed matmul weights ----
++    // The output layer and as many whole layers as fit are loaded once into a locked area. The other layers cycle
++    // through a ring of R layer-sized slots: when a layer starts, the next R-1 streamed layers are read into their
++    // slots with big direct reads. Memory use is fixed; nothing depends on the OS keeping pages around.
++    struct dense_tensor {
++        int    layer;
++        range  where;
++        size_t region_off; // start of this tensor's aligned read region inside its layer area
++        size_t data_off;   // where the data starts inside that region
++        char * pinned = nullptr; // pinned tensors: the data itself
++    };
++    std::unordered_map<std::string, dense_tensor> dstream;        // by tensor name
++    std::unordered_map<const ggml_tensor *, dense_tensor *> dstream_by_ptr;
++    std::mutex dstream_mtx;
++    bool   dstream_on = false;
++    int    ring_n = 4;
++    size_t ring_slot_bytes = 0;
++    char * ring = nullptr;
++    char * pin_arena = nullptr;
++    size_t pin_bytes = 0, ring_bytes = 0;
++    std::vector<int> ring_layer;           // layer held by each ring slot (-100 = empty)
++    std::vector<int> stream_order;         // streamed layers in the order they run
++    std::map<int, int> stream_pos;         // layer -> index in stream_order
++    int    cur_stream_layer = -100;
++    int    cur_pos = -1;          // position in stream_order of the running layer
++    uint64_t cur_step = 0;        // how many streamed-layer starts so far; the running layer uses slot cur_step % ring_n
++    size_t dstream_bytes = 0, dstream_layer_loads = 0, dstream_misses = 0;
++    double dstream_wait_s = 0;
++
++    static size_t region_size(const range & r) {
++        const size_t a = r.off / ALIGN * ALIGN;
++        return (r.off + r.len + ALIGN - 1) / ALIGN * ALIGN - a;
++    }
++
++    static char * alloc_locked(size_t bytes) {
++#ifdef _WIN32
++        return (char *) VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
++#else
++        void * p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++        return p == MAP_FAILED ? nullptr : (char *) p;
++#endif
++    }
++
++    // matmul weights worth managing: 2D+ and at least 256 KB (norms and small parameters stay with llama.cpp)
++    static bool dense_managed(const range & r) {
++        return r.len >= (256u << 10);
++    }
++
++    bool setup_dense_stream(size_t budget, int ring_slots) {
++        ring_n = std::max(2, ring_slots);
++        // bytes each layer needs (managed tensors only)
++        std::map<int, size_t> layer_bytes;
++        for (auto & kv : dense_by_layer) {
++            for (auto & r : kv.second) {
++                if (dense_managed(r)) {
++                    layer_bytes[kv.first] += region_size(r);
++                }
++            }
++        }
++        for (auto & kv : layer_bytes) {
++            if (kv.first >= 0) {
++                ring_slot_bytes = std::max(ring_slot_bytes, kv.second);
++            }
++        }
++        ring_bytes = ring_slot_bytes * ring_n;
++        if (budget < ring_bytes + layer_bytes[-1]) {
++            fprintf(stderr, "expert-cache: dense budget %.2f GB is below the minimum %.2f GB (ring + output layer)\n",
++                    budget / 1e9, (ring_bytes + layer_bytes[-1]) / 1e9);
++            return false;
++        }
++        // pin: output layer, then whole layers from the last one backwards
++        std::vector<int> pinned_layers = { -1 };
++        size_t pinned = layer_bytes[-1];
++        for (int L = n_model_layers - 1; L >= 0; L--) {
++            if (pinned + layer_bytes[L] + ring_bytes > budget) {
++                break;
++            }
++            pinned += layer_bytes[L];
++            pinned_layers.push_back(L);
++        }
++        pin_bytes = pinned;
++        pin_arena = alloc_locked(pin_bytes);
++        ring = alloc_locked(ring_bytes);
++        if (!pin_arena || !ring) {
++            fprintf(stderr, "expert-cache: could not allocate the dense buffers\n");
++            return false;
++        }
++#ifdef _WIN32
++        SIZE_T mn, mx;
++        GetProcessWorkingSetSize(GetCurrentProcess(), &mn, &mx);
++        SetProcessWorkingSetSizeEx(GetCurrentProcess(), mn + pin_bytes + ring_bytes, mx + pin_bytes + ring_bytes,
++                                   QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
++        VirtualLock(pin_arena, pin_bytes);
++        VirtualLock(ring, ring_bytes);
++#endif
++        // lay out tensors: pinned ones in the arena, streamed ones at a fixed offset inside any ring slot
++        size_t pin_off = 0;
++        std::vector<job> pin_jobs;
++        std::set<int> pinned_set(pinned_layers.begin(), pinned_layers.end());
++        for (auto & kv : dense_by_layer) {
++            const int L = kv.first;
++            size_t slot_off = 0;
++            for (auto & r : kv.second) {
++                if (!dense_managed(r)) {
++                    continue;
++                }
++                const size_t a = r.off / ALIGN * ALIGN;
++                dense_tensor d = { L, r, 0, r.off - a };
++                if (pinned_set.count(L)) {
++                    d.region_off = pin_off;
++                    d.pinned     = pin_arena + pin_off + d.data_off;
++                    pin_jobs.push_back({ r.file, a, region_size(r), pin_arena + pin_off, n_slots + ring_n });
++                    pin_off += region_size(r);
++                } else {
++                    d.region_off = slot_off;
++                    slot_off += region_size(r);
++                }
++                dstream[r.name] = d;
++            }
++        }
++        for (int L = 0; L < n_model_layers; L++) {
++            if (!pinned_set.count(L) && layer_bytes.count(L)) {
++                stream_pos[L] = (int) stream_order.size();
++                stream_order.push_back(L);
++            }
++        }
++        ring_layer.assign(ring_n, -100);
++        {
++            std::lock_guard<std::mutex> lock(mtx);
++            pending.resize(n_slots + ring_n + 1, 0); // ring slots, then one id for the pinned load
++        }
++        // load the pinned part once, now
++        const auto t0 = std::chrono::steady_clock::now();
++        submit(merge_jobs(pin_jobs), true);
++        wait_slot(n_slots + ring_n);
++        fprintf(stderr, "expert-cache: dense streaming: %.2f GB pinned (output layer + %zu of %d layers), "
++                        "%d-slot ring of %.0f MB for the other %zu layers (loaded in %.1f s)\n",
++                pin_bytes / 1e9, pinned_layers.size() - 1, n_model_layers, ring_n, ring_slot_bytes / 1e6,
++                stream_order.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
++        dstream_on = true;
++        ggml_cpu_set_weight_hook(&expert_cache::weight_hook, this);
++        return true;
++    }
++
++    // reads that continue each other in both the file and the buffer become one big read
++    static std::vector<job> merge_jobs(const std::vector<job> & js) {
++        std::vector<job> out;
++        for (const job & j : js) {
++            if (!out.empty()) {
++                job & b = out.back();
++                if (b.file == j.file && b.slot == j.slot && b.off + b.len == j.off && b.dst + b.len == j.dst) {
++                    b.len += j.len;
++                    continue;
++                }
++            }
++            out.push_back(j);
++        }
++        return out;
++    }
++
++    // queue jobs (chunked) on the urgent queue
++    void submit(const std::vector<job> & js, bool front) {
++        std::lock_guard<std::mutex> lock(mtx);
++        for (const job & j : js) {
++            for (size_t o = 0; o < j.len; o += chunk_bytes) {
++                job c = { j.file, j.off + o, std::min(chunk_bytes, j.len - o), j.dst + o, j.slot, false, now_ns() };
++                front ? queue.push_front(c) : queue.push_back(c);
++                pending[j.slot]++;
++            }
++        }
++        cv_work.notify_all();
++    }
++
++    void wait_slot(int slot) {
++        std::unique_lock<std::mutex> lock(mtx);
++        cv_done.wait(lock, [&] { return pending[slot] == 0; });
++    }
++
++    // read stream layer L into ring slot k (caller holds dstream_mtx)
++    void load_stream_layer(int L, int k, bool urgent) {
++        std::vector<job> js;
++        for (auto & r : dense_by_layer[L]) {
++            if (!dense_managed(r)) {
++                continue;
++            }
++            const dense_tensor & d = dstream[r.name];
++            js.push_back({ r.file, r.off / ALIGN * ALIGN, region_size(r), ring + (size_t) k * ring_slot_bytes + d.region_off, n_slots + k });
++            dstream_bytes += region_size(r);
++        }
++        ring_layer[k] = L;
++        dstream_layer_loads++;
++        submit(merge_jobs(js), urgent);
++    }
++
++    static const void * weight_hook(const ggml_tensor * src0, int ith, void * ud) {
++        return ((expert_cache *) ud)->weight(src0, ith);
++    }
++
++    const void * weight(const ggml_tensor * src0, int) {
++        dense_tensor * d;
++        int k;
++        {
++            std::lock_guard<std::mutex> lock(dstream_mtx);
++            auto it = dstream_by_ptr.find(src0);
++            if (it == dstream_by_ptr.end()) {
++                auto nit = dstream.find(ggml_get_name(src0));
++                d = nit == dstream.end() ? nullptr : &nit->second;
++                if (d && (size_t) ggml_nbytes(src0) != d->where.len) {
++                    d = nullptr; // same name, different tensor (another model in the process)
++                }
++                dstream_by_ptr[src0] = d;
++            } else {
++                d = it->second;
++            }
++            if (!d) {
++                return nullptr; // not ours: llama.cpp's own copy
++            }
++            if (d->pinned) {
++                return d->pinned;
++            }
++            const int L   = d->layer;
++            const int pos = stream_pos[L];
++            const int n   = (int) stream_order.size();
++            if (L != cur_stream_layer) {
++                // a new streamed layer started. Slots go round-robin by *step*, not by position: layer counts that
++                // don't divide by the ring size would otherwise make a read-ahead land on the slot still in use.
++                cur_stream_layer = L;
++                cur_pos = pos;
++                cur_step++;
++                k = (int) (cur_step % ring_n);
++                if (ring_layer[k] != L) {
++                    dstream_misses++;
++                    load_stream_layer(L, k, true);
++                }
++                for (int a = 1; a < ring_n; a++) {
++                    const int nk = (int) ((cur_step + a) % ring_n);
++                    const int nl = stream_order[(pos + a) % n];
++                    if (ring_layer[nk] != nl) {
++                        load_stream_layer(nl, nk, false);
++                    }
++                }
++            }
++            k = (int) (cur_step % ring_n);
++        }
++        const auto t0 = std::chrono::steady_clock::now();
++        wait_slot(n_slots + k);
++        {
++            std::lock_guard<std::mutex> lock(dstream_mtx);
++            dstream_wait_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++        }
++        return ring + (size_t) k * ring_slot_bytes + d->region_off + d->data_off;
++    }
++
++    // find every non-expert tensor in the model files, grouped by layer
++    bool setup_dense(const std::vector<std::string> & files) {
++        for (int fi = 0; fi < (int) files.size(); fi++) {
++            gguf_init_params gp = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
++            gguf_context * g = gguf_init_from_file(files[fi].c_str(), gp);
++            if (!g) {
++                return false;
++            }
++            if (fi == 0) {
++                const std::string arch = gguf_get_val_str(g, gguf_find_key(g, "general.architecture"));
++                n_model_layers = gguf_get_val_u32(g, gguf_find_key(g, (arch + ".block_count").c_str()));
++            }
++            const size_t data = gguf_get_data_offset(g);
++            for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
++                const std::string name = gguf_get_tensor_name(g, i);
++                if (name.find("_exps.") != std::string::npos || name.rfind("token_embd", 0) == 0) {
++                    continue; // experts have their own cache; the embedding table is read one row per word
++                }
++                const int layer = name.rfind("blk.", 0) == 0 ? atoi(name.c_str() + 4) : -1;
++                dense_by_layer[layer].push_back({ fi, data + gguf_get_tensor_offset(g, i), gguf_get_tensor_size(g, i), name });
++            }
++            gguf_free(g);
++        }
++        if (dense_packed_file >= 0) {
++            std::ifstream idx(dense_packed_path + ".idx");
++            std::unordered_map<std::string, std::pair<size_t, size_t>> where;
++            std::string name;
++            size_t off, len;
++            while (idx >> name >> off >> len) {
++                where[name] = { off, len };
++            }
++            size_t moved = 0;
++            for (auto & kv : dense_by_layer) {
++                for (auto & r : kv.second) {
++                    if (!dense_managed(r)) {
++                        continue;
++                    }
++                    auto it = where.find(r.name);
++                    if (it == where.end() || it->second.second != r.len || it->second.first % ALIGN) {
++                        fprintf(stderr, "expert-cache: %s.idx doesn't match the model (%s)\n", dense_packed_path.c_str(), r.name.c_str());
++                        return false;
++                    }
++                    r.file = dense_packed_file;
++                    r.off  = it->second.first;
++                    moved++;
++                }
++            }
++            fprintf(stderr, "expert-cache: reading %zu always-needed tensors from %s.bin\n", moved, dense_packed_path.c_str());
++        }
++        size_t total = 0;
++        for (auto & kv : dense_by_layer) {
++            for (auto & r : kv.second) {
++                total += r.len;
++            }
++        }
++        fprintf(stderr, "expert-cache: %.2f GB of always-needed weights over %d layers\n", total / 1e9, n_model_layers);
++        return true;
++    }
++    // A second-drive copy made by stripe_experts.py: whole experts (e % mod == rem) or every expert's tail.
++    bool load_stripe(const char * st) {
++        std::ifstream sf(std::string(st) + ".stripe");
++        std::string mode;
++        if (!sf || !(sf >> mode)) {
++            fprintf(stderr, "expert-cache: cannot read %s.stripe\n", st);
++            return false;
++        }
++        const bool tail = mode == "tail";
++        if (!tail) {
++            stripe_mod = atoi(mode.c_str());
++            if (!(sf >> stripe_rem) || stripe_mod < 2) {
++                fprintf(stderr, "expert-cache: bad header in %s.stripe\n", st);
++                return false;
++            }
++        }
++        const int sfile = (int) paths.size();
++        paths.push_back(std::string(st) + ".bin");
++        int Ls;
++        size_t off2, blk, n_layers = 0;
++        while (sf >> Ls >> off2 >> blk) {
++            size_t split = 0;
++            if (tail && !(sf >> split)) {
++                break;
++            }
++            auto b = blocks.find(Ls);
++            if (b == blocks.end() || b->second.per_expert != blk || (tail && (split == 0 || split % ALIGN))) {
++                fprintf(stderr, "expert-cache: %s.stripe doesn't match layer %d\n", st, Ls);
++                return false;
++            }
++            if (tail) {
++                b->second.file3   = sfile;
++                b->second.offset3 = off2;
++                b->second.split   = split;
++            } else {
++                b->second.file2   = sfile;
++                b->second.offset2 = off2;
++            }
++            n_layers++;
++        }
++        second_drive = true;
++        fprintf(stderr, "expert-cache: %s from %s.bin (%zu layers)\n",
++                tail ? "every expert's tail" : "1 in N whole experts", st, n_layers);
++        return true;
++    }
++    bool second_drive = false;
++
++    // Queue the read(s) that fill `dst` with expert e of t; returns where the expert starts inside dst.
++    // Tail mode reads the head from the main drive and the tail from the second one at the same time.
++    size_t queue_reads(const tensor_info * t, int e, char * dst, int slot, std::vector<job> & todo) {
++        size_t bytes, data_off;
++        // tail split helps one-at-a-time loads (generation); whole-expert striping helps big batches (prompts).
++        // With both files present, use the one that fits the phase.
++        const bool use_tail = t->split && (gen_phase || t->file2 < 0);
++        if (use_tail) {
++            const size_t start = t->offset + (size_t) e * t->per_expert; // packed blocks are ALIGN-aligned
++            const size_t tail  = t->per_expert - t->split;
++            todo.push_back({ t->file, start, t->split, dst, slot });
++            todo.push_back({ t->file3, t->offset3 + (size_t) e * tail, tail, dst + t->split, slot });
++            stripe_reads++;
++            bytes    = t->per_expert;
++            data_off = 0;
++        } else {
++            int file;
++            size_t start;
++            locate(t, e, &file, &start);
++            const size_t a_start = start / ALIGN * ALIGN;
++            const size_t a_end   = (start + t->per_expert + ALIGN - 1) / ALIGN * ALIGN;
++            todo.push_back({ file, a_start, a_end - a_start, dst, slot });
++            bytes    = a_end - a_start;
++            data_off = start - a_start;
++        }
++        bytes_read += bytes;
++        if (gen_phase) {
++            g_bytes += bytes;
++        }
++        return data_off;
++    }
++
++    // where to read expert e of t from
++    void locate(const tensor_info * t, int e, int * file, size_t * start) {
++        if (t->file2 >= 0 && e % stripe_mod == stripe_rem) {
++            *file  = t->file2;
++            *start = t->offset2 + (size_t) (e / stripe_mod) * t->per_expert;
++            stripe_reads++;
++        } else {
++            *file  = t->file;
++            *start = t->offset + (size_t) e * t->per_expert;
++        }
++    }
++    std::unordered_map<int, tensor_info> blocks; // layer -> packed block (node-based map, so pointers stay valid)
++    bool packed = false;
++
++    static const tensor_info * unit(const tensor_info * t) { return t->block ? t->block : t; }
++
++    // --- model layout ---
++    std::vector<std::string> paths;
++    std::unordered_map<std::string, tensor_info> by_name;             // "blk.3.ffn_up_exps.weight" -> location
++    std::unordered_map<const ggml_tensor *, const tensor_info *> by_tensor;
++    std::unordered_map<int, std::vector<const tensor_info *>> by_layer;   // layer -> its expert tensors
++
++    // --- cache storage: n_slots fixed-size slots in one allocation ---
++    char * slab = nullptr;
++    size_t slab_bytes = 0;
++    size_t slot_bytes = 0;
++    int    n_slots    = 0;
++    bool   locked     = false;
++
++    // LRU: front = most recently used. key = tensor_info address + expert
++    struct key_t {
++        const tensor_info * t;
++        int expert;
++        bool operator==(const key_t & o) const { return t == o.t && expert == o.expert; }
++    };
++    struct key_hash {
++        size_t operator()(const key_t & k) const { return std::hash<const void *>()(k.t) ^ ((size_t) k.expert * 0x9e3779b97f4a7c15ull); }
++    };
++    struct entry {
++        key_t key;
++        int   slot;
++        size_t data_off; // where the expert starts inside the slot (reads are rounded down to ALIGN)
++        uint64_t last_use = 0;
++    };
++    uint64_t clock = 0;          // +1 per op
++    uint64_t spec_min_age = 400; // a guess may only evict experts unused for this many ops (~3 tokens on the 122B)
++    uint64_t spec_min_age_prompt = 6; // while reading a prompt: experts unused for ~2 layers are fair game
++    size_t spec_skipped = 0;
++    std::list<entry> lru;
++    std::unordered_map<key_t, std::list<entry>::iterator, key_hash> index;
++    std::vector<int> free_slots;
++
++    // --- stats ---
++    size_t hits = 0, misses = 0, prefetched = 0, pregated = 0, bytes_read = 0;
++    double io_seconds = 0; // time the model spent waiting for reads
++
++    // --- I/O threads: each has its own file handles so reads really run in parallel ---
++    struct job { int file; size_t off; size_t len; char * dst; int slot; bool spec = false; int64_t t_enq = 0; bool gen = false; };
++
++    static int64_t now_ns() {
++        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++    }
++    // --- timing breakdown (protected by mtx) ---
++    size_t n_reads = 0, n_urgent_reads = 0, busy = 0, max_busy = 0;
++    double read_s = 0, urgent_queue_s = 0;           // time inside ReadFile/pread; urgent jobs' time waiting in line
++    size_t n_waits = 0, wait_hist[5] = {};            // waits <0.5 ms, <2, <5, <10, >=10 ms
++    // generation-only (one token per step) versions, so prompt processing doesn't skew them
++    bool   gen_phase = false;
++    size_t g_bytes = 0, g_waits = 0, g_ops = 0, g_urgent_reads = 0;
++    double g_wait_s = 0, g_urgent_queue_s = 0;
++    double wait_q_urgent = 0, wait_q_spec = 0, wait_busy = 0; // what was ahead of us when a wait started (summed)
++    std::vector<std::thread> workers;
++    std::deque<job> queue;      // reads the model needs now (or within this layer)
++    std::deque<job> spec_queue; // pre-gating guesses: only run when there's spare capacity
++    int active_spec = 0;
++    int spec_limit  = 8;        // at most this many I/O threads on guesses, so urgent reads always find a free one
++    // guesses that caused a read, per layer; once that layer runs, the wrong ones are moved to the evict-first end
++    std::unordered_map<int, std::vector<key_t>> spec_keys;
++    size_t spec_wrong = 0, spec_promoted = 0;
++    size_t late = 0;
++    size_t overflow = 0; // experts read from the model file because the cache had no free slot // needed experts that were in the cache but still loading when the op asked for them
++    std::vector<int> pending; // per slot: chunks still being read (0 = ready)
++    bool stopping = false;
++    std::mutex mtx;
++    std::condition_variable cv_work, cv_done;
++
++    ~expert_cache() {
++        {
++            std::lock_guard<std::mutex> lock(mtx);
++            stopping = true;
++        }
++        cv_work.notify_all();
++        for (auto & w : workers) {
++            w.join();
++        }
++        ggml_cpu_set_expert_hook(nullptr, nullptr);
++        ggml_cpu_set_weight_hook(nullptr, nullptr);
++        if (dense_worker.joinable()) {
++            {
++                std::lock_guard<std::mutex> lock(dense_mtx);
++                dense_stop = true;
++            }
++            dense_cv.notify_one();
++            dense_worker.join();
++        }
++#ifdef _WIN32
++        if (slab && locked) VirtualUnlock(slab, slab_bytes);
++        if (slab) VirtualFree(slab, 0, MEM_RELEASE);
++#else
++        if (slab) munmap(slab, slab_bytes);
++#endif
++    }
++
++    static std::vector<std::string> split_paths(const std::string & path) {
++        const size_t pos = path.rfind("-00001-of-");
++        if (pos == std::string::npos) {
++            return { path };
++        }
++        const int n = atoi(path.c_str() + pos + 10);
++        std::vector<std::string> out;
++        for (int i = 1; i <= n; i++) {
++            char num[8];
++            snprintf(num, sizeof(num), "%05d", i);
++            out.push_back(path.substr(0, pos + 1) + num + path.substr(pos + 6));
++        }
++        return out;
++    }
++
++    bool init(const std::string & model_path, double cache_gb, int n_io_threads) {
++        paths = split_paths(model_path);
++        int64_t n_expert = 0;
++        size_t max_expert = 0;
++        for (int fi = 0; fi < (int) paths.size(); fi++) {
++            gguf_init_params gp = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
++            gguf_context * g = gguf_init_from_file(paths[fi].c_str(), gp);
++            if (!g) {
++                return false;
++            }
++            if (fi == 0) {
++                const std::string arch = gguf_get_val_str(g, gguf_find_key(g, "general.architecture"));
++                n_expert = gguf_get_val_u32(g, gguf_find_key(g, (arch + ".expert_count").c_str()));
++            }
++            const size_t data = gguf_get_data_offset(g);
++            for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
++                const std::string name = gguf_get_tensor_name(g, i);
++                if (name.find("_exps.") == std::string::npos) {
++                    continue;
++                }
++                const size_t per = gguf_get_tensor_size(g, i) / n_expert;
++                by_name[name] = { atoi(name.c_str() + 4), fi, data + gguf_get_tensor_offset(g, i), per, {} };
++                max_expert = std::max(max_expert, per);
++            }
++            gguf_free(g);
++        }
++        if (by_name.empty()) {
++            return false;
++        }
++        if (const char * pk = getenv("EXPERT_CACHE_PACKED")) {
++            // read one ~6.9 MB block per expert (gate+up+down together) from repack_experts.py's output
++            std::ifstream idx(std::string(pk) + ".idx");
++            if (!idx) {
++                fprintf(stderr, "expert-cache: cannot open %s.idx\n", pk);
++                return false;
++            }
++            const int pfile = (int) paths.size();
++            paths.push_back(std::string(pk) + ".bin");
++            std::string name;
++            int L;
++            size_t base, block, off, per;
++            size_t n_parts = 0;
++            while (idx >> name >> L >> base >> block >> off >> per) {
++                auto it = by_name.find(name);
++                if (it == by_name.end() || it->second.per_expert != per) {
++                    fprintf(stderr, "expert-cache: %s in the packed index doesn't match the model\n", name.c_str());
++                    return false;
++                }
++                tensor_info & b = blocks[L];
++                b = { L, pfile, base, block, {} };
++                it->second.block    = &b;
++                it->second.part_off = off;
++                max_expert = std::max(max_expert, block);
++                n_parts++;
++            }
++            if (n_parts != by_name.size()) {
++                fprintf(stderr, "expert-cache: packed index covers %zu of %zu expert tensors\n", n_parts, by_name.size());
++                return false;
++            }
++            for (auto & kv : blocks) {
++                by_layer[kv.first] = { &kv.second };
++            }
++            packed = true;
++            fprintf(stderr, "expert-cache: packed mode, %zu layers, %.2f MB per expert block\n", blocks.size(), max_expert / 1e6);
++
++            for (const char * var : { "EXPERT_CACHE_STRIPE", "EXPERT_CACHE_TAIL" }) {
++                const char * st = getenv(var);
++                if (st && !load_stripe(st)) {
++                    return false;
++                }
++            }
++        }
++        std::unordered_map<int, std::vector<tensor_info *>> per_layer;
++        for (auto & kv : by_name) {
++            per_layer[atoi(kv.first.c_str() + 4)].push_back(&kv.second); // "blk.<n>."
++        }
++        for (auto & kv : per_layer) {
++            if (packed) {
++                break; // one block per expert already covers every tensor, no siblings to load
++            }
++            by_layer[kv.first].assign(kv.second.begin(), kv.second.end());
++            for (auto * a : kv.second) {
++                for (auto * b : kv.second) {
++                    if (a != b) {
++                        a->siblings.push_back(b);
++                    }
++                }
++            }
++        }
++
++        // a slot holds one expert of one tensor, plus room to round the read out to ALIGN on both ends
++        slot_bytes = (max_expert + 2 * ALIGN + ALIGN - 1) / ALIGN * ALIGN;
++        n_slots    = (int) (cache_gb * 1e9 / slot_bytes);
++        slab_bytes = (size_t) n_slots * slot_bytes;
++#ifdef _WIN32
++        slab = (char *) VirtualAlloc(nullptr, slab_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
++#else
++        slab = (char *) mmap(nullptr, slab_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++        if (slab == MAP_FAILED) {
++            slab = nullptr;
++        }
++#endif
++        if (!slab) {
++            fprintf(stderr, "expert-cache: could not allocate %.1f GB\n", slab_bytes / 1e9);
++            return false;
++        }
++#ifdef _WIN32
++        // Pin the cache in physical memory. Unbuffered reads must lock every destination page first; pages Windows
++        // has trimmed from our working set get faulted back one 4 KB page at a time, which made each 2.3 MB read
++        // take ~7 ms instead of ~1 ms. Locking once up front removes that. Opt out with EXPERT_CACHE_NO_LOCK=1.
++        if (!getenv("EXPERT_CACHE_NO_LOCK")) {
++            const SIZE_T extra = (SIZE_T) 1 << 30;
++            const bool ws_ok = SetProcessWorkingSetSizeEx(GetCurrentProcess(), slab_bytes + extra, slab_bytes + 4 * extra,
++                                                          QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
++            const auto t_lock = std::chrono::steady_clock::now();
++            locked = ws_ok && VirtualLock(slab, slab_bytes);
++            fprintf(stderr, "expert-cache: %s the cache in RAM (%.1f s)%s\n", locked ? "locked" : "could NOT lock",
++                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t_lock).count(),
++                    locked ? "" : ", reads will be slower (Windows may trim cache pages)");
++        }
++#endif
++        for (int i = n_slots - 1; i >= 0; i--) {
++            free_slots.push_back(i);
++        }
++        pending.assign(n_slots, 0);
++
++        if (const char * v = getenv("EXPERT_CACHE_MAX_MBPS")) {
++            max_bps = atof(v) * 1e6;
++            fprintf(stderr, "expert-cache: simulating a drive capped at %.0f MB/s\n", max_bps / 1e6);
++        }
++        if (const char * v = getenv("EXPERT_CACHE_SPEC_LIMIT")) {
++            spec_limit = atoi(v); // I/O threads guesses may use
++        }
++        if (const char * v = getenv("EXPERT_CACHE_SPEC_AGE")) {
++            spec_min_age = strtoull(v, nullptr, 10); // ops an expert must go unused before a guess may evict it
++        }
++        if (const char * kb = getenv("EXPERT_CACHE_CHUNK_KB")) {
++            chunk_bytes = (size_t) atoi(kb) * 1024 / ALIGN * ALIGN;
++        }
++        if (const char * dp = getenv("EXPERT_CACHE_DENSE_PACKED")) {
++            dense_packed_file = (int) paths.size();
++            dense_packed_path = dp;
++            paths.push_back(std::string(dp) + ".bin");
++        }
++        for (int t = 0; t < n_io_threads; t++) {
++            workers.emplace_back(&expert_cache::io_loop, this);
++        }
++        {
++            const auto model_files = split_paths(model_path);
++            const char * pin = getenv("EXPERT_CACHE_PIN_GB");
++            const char * dgb = getenv("EXPERT_CACHE_DENSE_GB");
++            dense_prefetch = getenv("EXPERT_CACHE_DENSE_AHEAD") != nullptr;
++            if (const char * v = getenv("EXPERT_CACHE_DENSE_AHEAD")) {
++                dense_ahead = std::max(1, atoi(v));
++            }
++            if (dgb) {
++                if (!setup_dense(model_files)) {
++                    return false;
++                }
++                const char * rn = getenv("EXPERT_CACHE_DENSE_RING");
++                if (!setup_dense_stream((size_t) (atof(dgb) * 1e9), rn ? atoi(rn) : 4)) {
++                    return false;
++                }
++                pin = nullptr;
++                dense_prefetch = false; // our own streaming replaces the OS hints
++            }
++            if ((pin || dense_prefetch) && (!setup_dense(model_files) || !map_views(model_files))) {
++                fprintf(stderr, "expert-cache: couldn't map the model for dense-weight handling\n");
++                return false;
++            }
++            if (pin) {
++                pin_dense((size_t) (atof(pin) * 1e9));
++            }
++            if (dense_prefetch) {
++                dense_worker = std::thread(&expert_cache::dense_loop, this);
++                fprintf(stderr, "expert-cache: loading always-needed weights %d layers ahead\n", dense_ahead);
++            }
++        }
++        ggml_cpu_set_expert_hook(&expert_cache::hook, this);
++
++        size_t total = 0;
++        for (auto & kv : by_name) {
++            total += kv.second.per_expert * n_expert;
++        }
++        fprintf(stderr, "expert-cache: %.1f GB for %d slots of %.2f MB (%.0f%% of the %.1f GB of experts), %d I/O threads, %zu KB reads\n",
++                slab_bytes / 1e9, n_slots, slot_bytes / 1e6, 100.0 * slab_bytes / total, total / 1e9, n_io_threads, chunk_bytes / 1024);
++        return true;
++    }
++
++    double max_bps = 0;          // EXPERT_CACHE_MAX_MBPS: cap total read speed to simulate a slower drive (0 = off)
++    std::mutex throttle_mtx;
++    double throttle_next = 0;    // seconds (steady clock) when the next read may start
++
++    // Returns the time (steady clock, seconds) this read may finish on a drive capped at max_bps; the caller does
++    // the real read and then sleeps until then. 0 = no cap.
++    double throttle_deadline(size_t len) {
++        if (max_bps <= 0) {
++            return 0;
++        }
++        std::lock_guard<std::mutex> lock(throttle_mtx);
++        const double now = now_ns() * 1e-9;
++        throttle_next = std::max(now, throttle_next) + len / max_bps;
++        return throttle_next;
++    }
++
++    size_t chunk_bytes = 4 << 20; // read size; whole experts (4 MB) beat smaller chunks on the PC SSD, same on the Mac
++
++    void io_loop() {
++        // own handles per thread: Windows serializes synchronous I/O on a shared handle
++#ifdef _WIN32
++        // the compute threads spin while they wait for us; make sure the reads still get CPU time
++        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
++        std::vector<HANDLE> fh;
++        for (auto & p : paths) {
++            fh.push_back(CreateFileA(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
++                                     FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS, nullptr));
++        }
++#else
++        std::vector<int> fh;
++        for (auto & p : paths) {
++#ifdef __linux__
++            // Linux: skip the page cache so reads don't also fill RAM with a second copy (all our offsets, sizes and
++            // buffers are 4 KB aligned); fall back to normal reads if the filesystem refuses O_DIRECT
++            int fd = open(p.c_str(), O_RDONLY | O_DIRECT);
++            if (fd < 0) {
++                fd = open(p.c_str(), O_RDONLY);
++            }
++#else
++            const int fd = open(p.c_str(), O_RDONLY);
++#endif
++#ifdef F_NOCACHE
++            fcntl(fd, F_NOCACHE, 1); // macOS: don't also keep a copy in the OS file cache
++#endif
++            fh.push_back(fd);
++        }
++#endif
++        for (;;) {
++            job j;
++            {
++                std::unique_lock<std::mutex> lock(mtx);
++                cv_work.wait(lock, [&] {
++                    return stopping || !queue.empty() || (!spec_queue.empty() && active_spec < spec_limit);
++                });
++                if (stopping) {
++                    break;
++                }
++                if (!queue.empty()) {
++                    j = queue.front();
++                    queue.pop_front();
++                    j.spec = false;
++                    n_urgent_reads++;
++                    urgent_queue_s += (now_ns() - j.t_enq) * 1e-9;
++                    if (j.gen) {
++                        g_urgent_reads++;
++                        g_urgent_queue_s += (now_ns() - j.t_enq) * 1e-9;
++                    }
++                } else {
++                    j = spec_queue.front();
++                    spec_queue.pop_front();
++                    j.spec = true;
++                    active_spec++;
++                }
++                busy++;
++                max_busy = std::max(max_busy, busy);
++            }
++            const int64_t r0 = now_ns();
++            const double deadline = throttle_deadline(j.len);
++            size_t done = 0;
++            while (done < j.len) {
++#ifdef _WIN32
++                OVERLAPPED ov = {};
++                const uint64_t off = j.off + done;
++                ov.Offset     = (DWORD) off;
++                ov.OffsetHigh = (DWORD) (off >> 32);
++                DWORD got = 0;
++                if (!ReadFile(fh[j.file], j.dst + done, (DWORD) (j.len - done), &got, &ov) || got == 0) {
++                    break;
++                }
++#else
++                const ssize_t got = pread(fh[j.file], j.dst + done, j.len - done, j.off + done);
++                if (got <= 0) {
++                    break;
++                }
++#endif
++                done += got;
++            }
++            if (deadline > 0) {
++                const double left = deadline - now_ns() * 1e-9;
++                if (left > 0) {
++                    std::this_thread::sleep_for(std::chrono::duration<double>(left));
++                }
++            }
++            {
++                std::lock_guard<std::mutex> lock(mtx);
++                busy--;
++                n_reads++;
++                read_s += (now_ns() - r0) * 1e-9;
++                if (j.spec) {
++                    active_spec--;
++                    cv_work.notify_one(); // a guess slot freed up
++                }
++                if (--pending[j.slot] == 0) {
++                    cv_done.notify_all();
++                }
++            }
++        }
++#ifdef _WIN32
++        for (auto h : fh) CloseHandle(h);
++#else
++        for (auto fd : fh) close(fd);
++#endif
++    }
++
++    const tensor_info * lookup(const ggml_tensor * t) {
++        auto it = by_tensor.find(t);
++        if (it != by_tensor.end()) {
++            return it->second;
++        }
++        auto nit = by_name.find(ggml_get_name(t));
++        const tensor_info * info = nit == by_name.end() ? nullptr : &nit->second;
++        // same name but a different size: another model in the process (e.g. a draft model), not ours
++        if (info && (size_t) ggml_nbytes(t) != info->per_expert * (size_t) t->ne[2]) {
++            info = nullptr;
++        }
++        by_tensor[t] = info;
++        return info;
++    }
++
++    static void hook(const ggml_tensor * src0, const ggml_tensor * src1, const int32_t * experts, int n, const void ** ptrs, void * ud) {
++        ((expert_cache *) ud)->fetch(src0, src1, experts, n, ptrs);
++    }
++
++    // Optional look-ahead: called once per layer while generating, with that layer's MoE input (already on the
++    // CPU, so no extra sync). Used for pre-gating.
++    std::function<void(int layer, const float * x, int n_embd, int n_tok)> predictor; // x: n_tok rows of n_embd
++    int last_predicted_layer = -1;
++
++    // Makes sure (t, expert) is in the cache or on its way. Returns the entry. Never evicts a slot that is still
++    // loading or that this op needs (protect). Called only from the compute thread, so lru/index need no lock.
++    // Returns nullptr when every slot is in use by this op or still loading (cache smaller than one op's experts);
++    // the caller then reads that expert straight from the model file instead.
++    entry * ensure(const tensor_info * t, int expert, const std::unordered_set<int> & protect, std::vector<job> & todo, bool * was_present) {
++        const key_t key = { t, expert };
++        auto it = index.find(key);
++        if (it != index.end()) {
++            lru.splice(lru.begin(), lru, it->second); // mark most recently used
++            it->second->last_use = clock;
++            *was_present = true;
++            return &*it->second;
++        }
++        *was_present = false;
++
++        int slot = -1;
++        if (!free_slots.empty()) {
++            slot = free_slots.back();
++            free_slots.pop_back();
++        } else {
++            std::lock_guard<std::mutex> lock(mtx); // pending is written by I/O threads
++            for (auto v = lru.rbegin(); v != lru.rend(); ++v) {
++                if (pending[v->slot] == 0 && !protect.count(v->slot)) {
++                    slot = v->slot;
++                    index.erase(v->key);
++                    lru.erase(std::next(v).base());
++                    break;
++                }
++            }
++        }
++        if (slot < 0) {
++            overflow++;
++            return nullptr;
++        }
++
++        const size_t data_off = queue_reads(t, expert, slab + (size_t) slot * slot_bytes, slot, todo);
++        lru.push_front({ key, slot, data_off, clock });
++        index[key] = lru.begin();
++        return &lru.front();
++    }
++
++    // Returns pointers to the requested experts. Missing ones are read in parallel; the same experts of the layer's
++    // other expert tensors are queued too, so they load while this op computes.
++    void fetch(const ggml_tensor * src0, const ggml_tensor * src1, const int32_t * experts, int n, const void ** ptrs) {
++        const tensor_info * info = lookup(src0);
++        if (!info) {
++            for (int i = 0; i < n; i++) {
++                ptrs[i] = nullptr; // not an expert tensor we know: read it the normal way
++            }
++            return;
++        }
++
++        clock++;
++        on_layer(info->layer);
++        gen_phase = src1 && src1->ne[2] == 1;
++        g_ops += gen_phase;
++        demote_wrong_guesses(info->layer, experts, n);
++
++        std::unordered_set<int> protect;
++        std::vector<job> todo;
++        std::vector<int> need;
++        for (int i = 0; i < n; i++) {
++            bool present;
++            entry * e = ensure(unit(info), experts[i], protect, todo, &present);
++            present ? hits++ : misses++;
++            if (!e) {
++                ptrs[i] = nullptr; // no room: llama.cpp reads it from the model file as usual
++                continue;
++            }
++            protect.insert(e->slot);
++            need.push_back(e->slot);
++            ptrs[i] = slab + (size_t) e->slot * slot_bytes + e->data_off + info->part_off;
++        }
++        const size_t n_needed_jobs = todo.size();
++        for (const tensor_info * sib : info->siblings) {
++            for (int i = 0; i < n; i++) {
++                bool present;
++                entry * e = ensure(sib, experts[i], protect, todo, &present);
++                if (!e) {
++                    continue;
++                }
++                protect.insert(e->slot);
++                if (!present) {
++                    prefetched++;
++                }
++            }
++        }
++
++        if (!todo.empty()) {
++            // split into chunks so a few misses still keep every I/O thread (and the SSD queue) busy;
++            // this op's own experts go first
++            const size_t chunk = chunk_bytes;
++            std::lock_guard<std::mutex> lock(mtx);
++            for (size_t k = 0; k < todo.size(); k++) {
++                const job & j = todo[k];
++                for (size_t o = 0; o < j.len; o += chunk) {
++                    job c = { j.file, j.off + o, std::min(chunk, j.len - o), j.dst + o, j.slot, false, now_ns() };
++                    c.gen = gen_phase;
++                    k < n_needed_jobs ? queue.push_front(c) : queue.push_back(c);
++                    pending[j.slot]++;
++                }
++            }
++            cv_work.notify_all();
++        }
++        promote_guesses(need, protect);
++
++        // look ahead now that this op's own reads are queued (gate and up share an input; only predict once)
++        if (predictor && info->layer != last_predicted_layer && src1 && src1->type == GGML_TYPE_F32 &&
++            src1->ne[1] == 1 && ggml_is_contiguous(src1)) {
++            last_predicted_layer = info->layer;
++            predictor(info->layer, (const float *) src1->data, (int) src1->ne[0], (int) src1->ne[2]);
++        }
++        {
++            std::lock_guard<std::mutex> lock(mtx);
++            for (int slot : need) {
++                if (pending[slot] != 0) {
++                    late++;
++                }
++            }
++        }
++
++        // wait only for this op's experts
++        const auto t0 = std::chrono::steady_clock::now();
++        std::unique_lock<std::mutex> lock(mtx);
++        bool must_wait = false;
++        for (int slot : need) {
++            must_wait |= pending[slot] != 0;
++        }
++        if (must_wait) {
++            n_waits++;
++            wait_q_urgent += queue.size();
++            wait_q_spec   += spec_queue.size();
++            wait_busy     += busy;
++        }
++        cv_done.wait(lock, [&] {
++            for (int slot : need) {
++                if (pending[slot] != 0) {
++                    return false;
++                }
++            }
++            return true;
++        });
++        const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++        io_seconds += waited;
++        if (gen_phase) {
++            g_wait_s += waited;
++            g_waits  += must_wait;
++        }
++        if (must_wait) {
++            const double ms = waited * 1e3;
++            wait_hist[ms < 0.5 ? 0 : ms < 2 ? 1 : ms < 5 ? 2 : ms < 10 ? 3 : 4]++;
++        }
++    }
++
++    // Starts loading these experts of a later layer in the background (pre-gating). Doesn't wait.
++    // Must not run while an op is computing (the llama.cpp eval callback runs between graph splits, so it's fine).
++    void prefetch_layer(int layer, const int32_t * experts, int m) {
++        auto it = by_layer.find(layer);
++        if (it == by_layer.end()) {
++            return;
++        }
++        std::vector<job> todo;
++        auto & keys = spec_keys[layer];
++        for (const tensor_info * t : it->second) {
++            for (int i = 0; i < m; i++) {
++                const key_t key = { t, experts[i] };
++                auto found = index.find(key);
++                if (found != index.end()) {
++                    lru.splice(lru.begin(), lru, found->second); // keep it around until the layer runs
++                    continue;
++                }
++                // a guess only takes a free slot or one whose expert hasn't been used for a while
++                int slot = -1;
++                if (!free_slots.empty()) {
++                    slot = free_slots.back();
++                    free_slots.pop_back();
++                } else {
++                    std::lock_guard<std::mutex> lock(mtx);
++                    auto & v = lru.back();
++                    if (clock - v.last_use >= (gen_phase ? spec_min_age : spec_min_age_prompt) && pending[v.slot] == 0) {
++                        slot = v.slot;
++                        index.erase(v.key);
++                        lru.pop_back();
++                    }
++                }
++                if (slot < 0) {
++                    spec_skipped++;
++                    continue;
++                }
++                const size_t data_off = queue_reads(t, experts[i], slab + (size_t) slot * slot_bytes, slot, todo);
++                lru.push_front({ key, slot, data_off, clock });
++                index[key] = lru.begin();
++                keys.push_back(key);
++                pregated++;
++            }
++        }
++        if (todo.empty()) {
++            return;
++        }
++        std::lock_guard<std::mutex> lock(mtx);
++        for (const job & j : todo) {
++            for (size_t o = 0; o < j.len; o += chunk_bytes) {
++                spec_queue.push_back({ j.file, j.off + o, std::min(chunk_bytes, j.len - o), j.dst + o, j.slot, false, now_ns() });
++                pending[j.slot]++;
++            }
++        }
++        cv_work.notify_all();
++    }
++
++    // The layer is running now, so we know which guesses were wrong: cancel their reads if they haven't started,
++    // otherwise move them to the evict-first end so they don't push out useful experts.
++    void demote_wrong_guesses(int layer, const int32_t * experts, int n) {
++        auto sk = spec_keys.find(layer);
++        if (sk == spec_keys.end()) {
++            return;
++        }
++        for (const key_t & key : sk->second) {
++            if (std::find(experts, experts + n, key.expert) != experts + n) {
++                continue; // right guess
++            }
++            spec_wrong++;
++            auto it = index.find(key);
++            if (it == index.end()) {
++                continue;
++            }
++            const int slot = it->second->slot;
++            std::lock_guard<std::mutex> lock(mtx);
++            size_t removed = 0;
++            for (auto q = spec_queue.begin(); q != spec_queue.end();) {
++                if (q->slot == slot) {
++                    q = spec_queue.erase(q);
++                    removed++;
++                } else {
++                    ++q;
++                }
++            }
++            pending[slot] -= (int) removed;
++            if (removed > 0 && pending[slot] == 0) {
++                // never read (or only partly): drop the entry, its slot is free again
++                lru.erase(it->second);
++                index.erase(it);
++                free_slots.push_back(slot);
++            } else if (removed == 0) {
++                lru.splice(lru.end(), lru, it->second);
++                it->second->last_use = 0;
++            } else {
++                // some chunks already in flight: data will be incomplete, so it must not be served; drop the
++                // entry but only reuse the slot after the reads land (it stays pending until then)
++                lru.erase(it->second);
++                index.erase(it);
++                draining.push_back(slot);
++            }
++        }
++        spec_keys.erase(sk);
++        // slots whose cancelled reads have now finished can be reused
++        std::lock_guard<std::mutex> lock(mtx);
++        for (auto d = draining.begin(); d != draining.end();) {
++            if (pending[*d] == 0) {
++                free_slots.push_back(*d);
++                d = draining.erase(d);
++            } else {
++                ++d;
++            }
++        }
++    }
++    std::vector<int> draining;
++
++    // Guesses that turned out to be needed now jump from the low-priority queue to the urgent one.
++    void promote_guesses(const std::vector<int> & need, const std::unordered_set<int> & soon) {
++        std::lock_guard<std::mutex> lock(mtx);
++        if (spec_queue.empty()) {
++            return;
++        }
++        std::unordered_set<int> need_set(need.begin(), need.end());
++        bool moved = false;
++        for (auto q = spec_queue.begin(); q != spec_queue.end();) {
++            if (need_set.count(q->slot)) {
++                queue.push_front(*q);
++            } else if (soon.count(q->slot)) {
++                queue.push_back(*q);
++            } else {
++                ++q;
++                continue;
++            }
++            q = spec_queue.erase(q);
++            spec_promoted++;
++            moved = true;
++        }
++        if (moved) {
++            cv_work.notify_all();
++        }
++    }
++
++    void print_stats() const {
++        const size_t total = hits + misses;
++        fprintf(stderr, "expert-cache: %zu lookups, %.1f%% already in RAM or loading, %zu loaded ahead for the next op, "
++                        "%zu loaded ahead by pre-gating, read %.1f GB from disk, model waited %.1f s for reads\n",
++                total, total ? 100.0 * hits / total : 0.0, prefetched, pregated, bytes_read / 1e9, io_seconds);
++        if (pregated) {
++            fprintf(stderr, "expert-cache: guesses: %zu loaded, %zu wrong (demoted or cancelled), %zu skipped (cache too full of recent experts), "
++                            "%zu reads promoted to urgent\n", pregated, spec_wrong, spec_skipped, spec_promoted);
++        }
++        fprintf(stderr, "expert-cache: %zu needed experts were still loading when asked for (%.1f%% of lookups)\n",
++                late, total ? 100.0 * late / total : 0.0);
++        if (dstream_on) {
++            fprintf(stderr, "expert-cache: dense streaming: %zu layer loads (%zu not ready in time), %.1f GB read, "
++                            "model waited %.1f s for dense weights\n",
++                    dstream_layer_loads, dstream_misses, dstream_bytes / 1e9, dstream_wait_s);
++        }
++        if (overflow) {
++            fprintf(stderr, "expert-cache: %zu experts didn't fit and were read from the model file directly\n", overflow);
++        }
++        if (n_reads) {
++            fprintf(stderr, "expert-cache: reads: %zu, avg %.2f ms each (%.0f MB/s per read), up to %zu at once; "
++                            "urgent reads waited %.2f ms in line on average\n",
++                    n_reads, 1e3 * read_s / n_reads, bytes_read / 1e6 / read_s, max_busy,
++                    n_urgent_reads ? 1e3 * urgent_queue_s / n_urgent_reads : 0.0);
++        }
++        if (second_drive) {
++            fprintf(stderr, "expert-cache: %zu reads went to the second drive\n", stripe_reads);
++        }
++        if (g_ops) {
++            fprintf(stderr, "expert-cache: generation only: read %.1f GB, model waited %.1f s over %zu waits (%.2f ms each), "
++                            "urgent reads waited %.2f ms in line\n",
++                    g_bytes / 1e9, g_wait_s, g_waits, g_waits ? 1e3 * g_wait_s / g_waits : 0.0,
++                    g_urgent_reads ? 1e3 * g_urgent_queue_s / g_urgent_reads : 0.0);
++        }
++        if (n_waits) {
++            fprintf(stderr, "expert-cache: ops that waited: %zu, avg %.2f ms; <0.5ms %zu, <2ms %zu, <5ms %zu, <10ms %zu, >=10ms %zu; "
++                            "at wait start on average %.1f urgent + %.1f guess reads queued, %.1f in flight\n",
++                    n_waits, 1e3 * io_seconds / n_waits, wait_hist[0], wait_hist[1], wait_hist[2], wait_hist[3], wait_hist[4],
++                    wait_q_urgent / n_waits, wait_q_spec / n_waits, wait_busy / n_waits);
++        }
++    }
++};
++
++// Pre-gating: at layer L's first expert op, guess which experts layer L+1 will pick by running layer L+1's router
++// on layer L's MoE input, and start loading them while layer L computes.
++struct pregate {
++    int m = 0;       // experts to prefetch per layer
++    int depth = 1;   // how many layers ahead to guess (more head start, less accurate)
++    int n_embd = 0;
++    int n_expert = 0;
++    float eps = 1e-6f;
++    std::map<int, std::vector<float>> router; // layer -> [n_expert][n_embd] (ffn_gate_inp)
++    std::map<int, std::vector<float>> norm;   // layer -> [n_embd] (post_attention_norm, the MoE input norm)
++    std::map<int, std::vector<int32_t>> guessed;
++    size_t right = 0, total = 0;
++    expert_cache * cache = nullptr;
++    std::vector<float> x, u, logits;
++    std::vector<int32_t> order;
++
++    static bool read_f32(const std::string & path, size_t off, size_t n, std::vector<float> & out) {
++        FILE * f = fopen(path.c_str(), "rb");
++        if (!f) {
++            return false;
++        }
++        out.resize(n);
++#ifdef _WIN32
++        _fseeki64(f, (long long) off, SEEK_SET);
++#else
++        fseeko(f, (off_t) off, SEEK_SET);
++#endif
++        const bool ok = fread(out.data(), sizeof(float), n, f) == n;
++        fclose(f);
++        return ok;
++    }
++
++    bool load(const std::string & model_path) {
++        const auto paths = expert_cache::split_paths(model_path);
++        for (size_t fi = 0; fi < paths.size(); fi++) {
++            gguf_init_params gp = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
++            gguf_context * g = gguf_init_from_file(paths[fi].c_str(), gp);
++            if (!g) {
++                return false;
++            }
++            if (fi == 0) {
++                const std::string arch = gguf_get_val_str(g, gguf_find_key(g, "general.architecture"));
++                n_embd   = gguf_get_val_u32(g, gguf_find_key(g, (arch + ".embedding_length").c_str()));
++                n_expert = gguf_get_val_u32(g, gguf_find_key(g, (arch + ".expert_count").c_str()));
++                k_used   = gguf_get_val_u32(g, gguf_find_key(g, (arch + ".expert_used_count").c_str()));
++                if (const char * v = getenv("PREGATE_PROMPT_ALL")) {
++                    prompt_all = atoi(v);
++                }
++                if (const char * v = getenv("PREGATE_PROMPT_TOKENS")) {
++                    prompt_tokens = atoi(v);
++                }
++                if (const char * v = getenv("PREGATE_PROMPT_THREADS")) {
++                    prompt_threads = atoi(v);
++                }
++                const int64_t k_eps = gguf_find_key(g, (arch + ".attention.layer_norm_rms_epsilon").c_str());
++                if (k_eps >= 0) {
++                    eps = gguf_get_val_f32(g, k_eps);
++                }
++            }
++            const size_t data = gguf_get_data_offset(g);
++            for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
++                const std::string name = gguf_get_tensor_name(g, i);
++                const bool is_router = name.find(".ffn_gate_inp.weight") != std::string::npos;
++                const bool is_norm   = name.find(".post_attention_norm.weight") != std::string::npos;
++                if (!is_router && !is_norm) {
++                    continue;
++                }
++                if (gguf_get_tensor_type(g, i) != GGML_TYPE_F32) {
++                    fprintf(stderr, "pre-gating: %s is not F32, skipping\n", name.c_str());
++                    continue;
++                }
++                const int layer = atoi(name.c_str() + 4);
++                auto & dst = is_router ? router[layer] : norm[layer];
++                if (!read_f32(paths[fi], data + gguf_get_tensor_offset(g, i), gguf_get_tensor_size(g, i) / sizeof(float), dst)) {
++                    return false;
++                }
++            }
++            gguf_free(g);
++        }
++        x.resize(n_embd);
++        u.resize(n_embd);
++        logits.resize(n_expert);
++        order.resize(n_expert);
++        return !router.empty();
++    }
++
++    int prompt_all = 1 << 30; // PREGATE_PROMPT_ALL: prompts longer than this preload the whole next layer instead
++    int k_used = 8;        // experts the router picks per token
++    std::vector<int32_t> all, pick;
++    std::vector<char> seen;
++
++    // x: layer L's MoE input for n_tok tokens, i.e. rms_norm(h) * norm_L. Undo layer L's norm weight, apply layer
++    // L+d's, run layer L+d's router, and preload its likely experts.
++    void predict(int layer, const float * x_in, int n, int n_tok) {
++        auto own = norm.find(layer);
++        if (n != n_embd || own == norm.end()) {
++            return;
++        }
++        if (n_tok > 1) {
++            if (!getenv("PREGATE_NO_PROMPT")) {
++                predict_prompt(layer, x_in, n_tok);
++            }
++            return;
++        }
++        route(layer, x_in);
++        for (int d = 1; d <= depth; d++) {
++            const int next = layer + d;
++            if (!score_next(next)) {
++                return;
++            }
++            std::partial_sort(order.begin(), order.begin() + m, order.end(),
++                              [&](int a, int b) { return logits[a] > logits[b]; });
++            if (d == 1 || !guessed.count(next)) {
++                guessed[next].assign(order.begin(), order.begin() + m);
++            }
++            cache->prefetch_layer(next, order.data(), m);
++        }
++    }
++
++    int prompt_tokens = 64;  // PREGATE_PROMPT_TOKENS: predict from at most this many tokens, evenly spaced (0 = all); 64 was as good as all 366
++    int prompt_threads = 8;  // PREGATE_PROMPT_THREADS
++
++    // Prompt: preload the union of the tokens' likely experts for the next layer. Routing every token is ~300M
++    // multiply-adds per layer for a 366-token prompt, so it's split over threads (and optionally sampled).
++    void predict_prompt(int layer, const float * x_in, int n_tok) {
++        const int next = layer + 1;
++        auto r  = router.find(next);
++        auto nw = norm.find(next);
++        const auto & w_own = norm[layer];
++        if (r == router.end() || nw == norm.end()) {
++            return;
++        }
++        if (n_tok > prompt_all) {
++            if (all.empty()) {
++                for (int e = 0; e < n_expert; e++) {
++                    all.push_back(e);
++                }
++            }
++            cache->prefetch_layer(next, all.data(), n_expert);
++            return;
++        }
++        std::vector<int> toks;
++        const int use = prompt_tokens > 0 ? std::min(prompt_tokens, n_tok) : n_tok;
++        for (int i = 0; i < use; i++) {
++            toks.push_back((int) ((int64_t) i * n_tok / use));
++        }
++        // combined weight: undo layer L's norm, apply layer L+1's (per dimension)
++        std::vector<float> wmix(n_embd);
++        for (int j = 0; j < n_embd; j++) {
++            wmix[j] = fabsf(w_own[j]) > 1e-8f ? nw->second[j] / w_own[j] : 0.0f;
++        }
++        const int nt = std::max(1, std::min(prompt_threads, (int) toks.size()));
++        std::vector<std::vector<char>> hit(nt, std::vector<char>(n_expert, 0));
++        auto work = [&](int ti) {
++            std::vector<float> xl(n_embd), lg(n_expert);
++            std::vector<int32_t> ord(n_expert);
++            const float * W = r->second.data();
++            for (size_t q = ti; q < toks.size(); q += nt) {
++                const float * xt = x_in + (size_t) toks[q] * n_embd;
++                for (int j = 0; j < n_embd; j++) {
++                    xl[j] = xt[j] * wmix[j];
++                }
++                for (int e = 0; e < n_expert; e++) {
++                    const float * w = W + (size_t) e * n_embd;
++                    float acc = 0;
++                    for (int j = 0; j < n_embd; j++) {
++                        acc += w[j] * xl[j];
++                    }
++                    lg[e] = acc;
++                    ord[e] = e;
++                }
++                std::partial_sort(ord.begin(), ord.begin() + k_used, ord.end(),
++                                  [&](int a, int b) { return lg[a] > lg[b]; });
++                for (int j = 0; j < k_used; j++) {
++                    hit[ti][ord[j]] = 1;
++                }
++            }
++        };
++        std::vector<std::thread> pool;
++        for (int ti = 1; ti < nt; ti++) {
++            pool.emplace_back(work, ti);
++        }
++        work(0);
++        for (auto & th : pool) {
++            th.join();
++        }
++        pick.clear();
++        for (int e = 0; e < n_expert; e++) {
++            for (int ti = 0; ti < nt; ti++) {
++                if (hit[ti][e]) {
++                    pick.push_back(e);
++                    break;
++                }
++            }
++        }
++        cache->prefetch_layer(next, pick.data(), (int) pick.size());
++    }
++
++    // u = rms-normalized hidden state (layer L's norm weight undone)
++    void route(int layer, const float * x_in) {
++        const auto & w = norm[layer];
++        for (int j = 0; j < n_embd; j++) {
++            u[j] = fabsf(w[j]) > 1e-8f ? x_in[j] / w[j] : 0.0f;
++        }
++    }
++
++    // logits of layer `next`'s router for u; order = 0..n_expert-1 ready for sorting. false if no such layer.
++    bool score_next(int next) {
++        auto r = router.find(next);
++        auto nw = norm.find(next);
++        if (r == router.end() || nw == norm.end()) {
++            return false;
++        }
++        for (int j = 0; j < n_embd; j++) {
++            x[j] = u[j] * nw->second[j];
++        }
++        const float * W = r->second.data();
++        for (int e = 0; e < n_expert; e++) {
++            float acc = 0;
++            const float * w = W + (size_t) e * n_embd;
++            for (int j = 0; j < n_embd; j++) {
++                acc += w[j] * x[j];
++            }
++            logits[e] = acc;
++            order[e] = e;
++        }
++        return true;
++    }
++
++    // score the guess once the real router output for that layer is known
++    void score(int layer, const int32_t * actual, int k) {
++        auto g = guessed.find(layer);
++        if (g == guessed.end()) {
++            return;
++        }
++        for (int j = 0; j < k; j++) {
++            if (std::find(g->second.begin(), g->second.end(), actual[j]) != g->second.end()) {
++                right++;
++            }
++        }
++        total += k;
++        guessed.erase(g);
++    }
++};
++
++// Start moe-stream inside any llama.cpp program (called from common_init_from_params). Reads:
++//   MOE_CACHE_GB        expert cache size in GB (required; unset = off)
++//   MOE_IO_THREADS      parallel reads (default 4)
++//   MOE_PREGATE         experts to preload per layer by prediction (default 0 = off)
++//   plus EXPERT_CACHE_PACKED / _STRIPE / _TAIL / _CHUNK_KB / _DENSE_GB / _MAX_MBPS and PREGATE_* (see README)
++inline bool moe_stream_start_from_env(const std::string & model_path) {
++    const char * gb = getenv("MOE_CACHE_GB");
++    if (!gb) {
++        return false;
++    }
++    static expert_cache cache;
++    static pregate pg;
++    const char * io = getenv("MOE_IO_THREADS");
++    if (!cache.init(model_path, atof(gb), io ? atoi(io) : 4)) {
++        fprintf(stderr, "moe-stream: could not start; running without it\n");
++        return false;
++    }
++    const char * m = getenv("MOE_PREGATE");
++    if (m && atoi(m) > 0 && pg.load(model_path)) {
++        pg.m     = atoi(m);
++        if (const char * k = getenv("MOE_EXPERTS_USED")) {
++            pg.k_used = atoi(k); // the model was told to use fewer experts per token (--override-kv)
++        }
++        pg.cache = &cache;
++        cache.predictor = [](int layer, const float * x, int n, int n_tok) { pg.predict(layer, x, n, n_tok); };
++        fprintf(stderr, "moe-stream: preloading the top %d predicted experts per layer\n", pg.m);
++    }
++    return true;
++}
+diff --git a/ggml/include/ggml-cpu.h b/ggml/include/ggml-cpu.h
+index dc6453c..60d374b 100644
+--- a/ggml/include/ggml-cpu.h
++++ b/ggml/include/ggml-cpu.h
+@@ -147,6 +147,21 @@ extern "C" {
+     GGML_BACKEND_API void ggml_cpu_fp32_to_bf16(const float *, ggml_bf16_t *, int64_t);
+     GGML_BACKEND_API void ggml_cpu_bf16_to_fp32(const ggml_bf16_t *, float *, int64_t);
+ 
++    // moe-router-study: let the caller supply expert weights for MUL_MAT_ID (e.g. from its own cache).
++    // Called on one thread before the op runs, with the experts it is about to use. The hook fills
++    // ptrs[i] with the start of expert experts[i] (same layout as src0->data + expert*nb[2]), or NULL
++    // to fall back to src0->data. Pointers must stay valid until the op finishes.
++    // src1 is the op's input (the MoE input activations), passed so the caller can look ahead without extra syncs.
++    typedef void (*ggml_cpu_expert_hook_t)(const struct ggml_tensor * src0, const struct ggml_tensor * src1,
++                                           const int32_t * experts, int n, const void ** ptrs, void * user_data);
++    GGML_BACKEND_API void ggml_cpu_set_expert_hook(ggml_cpu_expert_hook_t hook, void * user_data);
++
++    // moe-router-study: let the caller supply the weights of an ordinary MUL_MAT (e.g. streamed from disk into its
++    // own buffer). Called by every compute thread for the op; must return the same pointer (or NULL = use
++    // src0->data) to all of them, with the data ready. The pointer must stay valid until the op finishes.
++    typedef const void * (*ggml_cpu_weight_hook_t)(const struct ggml_tensor * src0, int ith, void * user_data);
++    GGML_BACKEND_API void ggml_cpu_set_weight_hook(ggml_cpu_weight_hook_t hook, void * user_data);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 8bb0ff7..22ca417 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1469,6 +1469,24 @@ UseGgmlGemm2:;
+ 
+ // ggml_compute_forward_mul_mat_id
+ 
++// moe-router-study expert hook (see ggml-cpu.h). One op runs at a time, so a single table is enough.
++static ggml_cpu_expert_hook_t g_expert_hook      = NULL;
++static void *                 g_expert_hook_data = NULL;
++static const void *           g_expert_ptrs[1024];
++
++void ggml_cpu_set_expert_hook(ggml_cpu_expert_hook_t hook, void * user_data) {
++    g_expert_hook      = hook;
++    g_expert_hook_data = user_data;
++}
++
++static ggml_cpu_weight_hook_t g_weight_hook      = NULL;
++static void *                 g_weight_hook_data = NULL;
++
++void ggml_cpu_set_weight_hook(ggml_cpu_weight_hook_t hook, void * user_data) {
++    g_weight_hook      = hook;
++    g_weight_hook_data = user_data;
++}
++
+ #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
+ 
+ struct mmid_row_mapping {
+@@ -1598,7 +1616,8 @@ static void ggml_compute_forward_mul_mat_id(
+ 
+     // IQ panel gemm (see iqp.h); per expert eligibility is decided below, but the work buffer is
+     // reserved for the whole node (ggml_graph_plan sizes it without params, use_ref only skips the dispatch)
+-    const bool iqp = ggml_cpu_iqp_supports_mul_mat_id(dst) && !params->use_ref;
++    const bool hooked = g_expert_hook != NULL && ne02 <= 1024;
++    const bool iqp = ggml_cpu_iqp_supports_mul_mat_id(dst) && !params->use_ref && !hooked;
+ 
+     char * iqp_panels = NULL;
+ 
+@@ -1660,6 +1679,22 @@ static void ggml_compute_forward_mul_mat_id(
+                 matrix_row_counts[i02] += 1;
+             }
+         }
++
++        if (hooked) {
++            int32_t used[1024];
++            int n_used = 0;
++            for (int i02 = 0; i02 < n_as; ++i02) {
++                g_expert_ptrs[i02] = NULL;
++                if (matrix_row_counts[i02] > 0) {
++                    used[n_used++] = i02;
++                }
++            }
++            const void * ptrs[1024];
++            g_expert_hook(src0, src1, used, n_used, ptrs, g_expert_hook_data);
++            for (int j = 0; j < n_used; ++j) {
++                g_expert_ptrs[used[j]] = ptrs[j];
++            }
++        }
+     }
+ 
+     // reset current_chunk
+@@ -1684,7 +1719,8 @@ static void ggml_compute_forward_mul_mat_id(
+             continue;
+         }
+ 
+-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
++        const char * src0_cur = hooked && g_expert_ptrs[cur_a] ? (const char *) g_expert_ptrs[cur_a]
++                                                              : (const char *) src0->data + cur_a * nb02;
+         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+ 
+@@ -1868,7 +1904,17 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             } break;
+         case GGML_OP_MUL_MAT:
+             {
+-                ggml_compute_forward_mul_mat(params, tensor);
++                const void * w = g_weight_hook ? g_weight_hook(tensor->src[0], params->ith, g_weight_hook_data) : NULL;
++                if (w) {
++                    // run the op on private copies that point at the supplied weights; the graph is untouched
++                    struct ggml_tensor src0 = *tensor->src[0];
++                    struct ggml_tensor dst  = *tensor;
++                    src0.data  = (void *) w;
++                    dst.src[0] = &src0;
++                    ggml_compute_forward_mul_mat(params, &dst);
++                } else {
++                    ggml_compute_forward_mul_mat(params, tensor);
++                }
+             } break;
+         case GGML_OP_MUL_MAT_ID:
+             {
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index e195f50..d6656cc 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1731,7 +1731,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
+-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++    // moe-router-study: LLAMA_NO_MMAP_PREFETCH skips asking the OS to read the whole file up front, which only
++    // floods the disk when the model is much bigger than RAM and the experts are streamed separately
++    ml.init_mappings(getenv("LLAMA_NO_MMAP_PREFETCH") == nullptr, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
+     // create the backend buffers

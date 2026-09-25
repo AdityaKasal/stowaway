@@ -1,0 +1,25 @@
+# category<TAB>prompt   ("\n" = newline). Mixed on purpose: routing may differ by topic.
+code	Write a Python function that parses a CSV file of stock trades (date, ticker, side, qty, price) and returns realized profit per ticker using FIFO matching. Include type hints.
+code	Explain what this C code does and find the bug:\n\nint sum(int *a, int n) {\n  int s;\n  for (int i = 0; i <= n; i++) s += a[i];\n  return s;\n}
+code	Write a React component in TypeScript for a countdown timer that shows days, hours, minutes and seconds until a given date, and cleans up its interval on unmount.
+code	How do I write a SQL query that returns the top 3 highest paid employees in each department? Show the query using window functions and explain it.
+math	Prove that the square root of 2 is irrational.
+math	A car accelerates from 0 to 60 mph in 6.2 seconds. Assuming constant acceleration, how far does it travel in that time? Show your work in metric and imperial units.
+math	Solve the integral of x^2 * e^x dx step by step.
+math	What is the probability of getting at least one six when rolling four fair dice? Then compare it to getting at least one double six in 24 rolls of two dice.
+chat	I'm a college student and I keep procrastinating on my assignments until the night before. What are some practical things I can try this week?
+chat	My friend keeps canceling plans at the last minute. How do I bring it up without it turning into a fight?
+chat	What should I think about when choosing between living on campus and renting an apartment with roommates?
+chat	I just moved to Tempe, Arizona. What are good ways to deal with the summer heat when I don't have a car?
+creative	Write a short story (about 300 words) about a lighthouse keeper who discovers the light has been signaling to someone.
+creative	Write a poem about debugging code at 3am, in the style of a sea shanty.
+creative	Describe a futuristic city built inside a giant canyon, focusing on sounds and smells.
+creative	Write the opening scene of a heist movie where the crew is robbing a museum of obsolete technology.
+facts	Explain how the immune system distinguishes between the body's own cells and invaders.
+facts	What caused the fall of the Western Roman Empire? Summarize the main competing theories.
+facts	How does a lithium-ion battery work, and why do they degrade over time?
+facts	Explain how the US Federal Reserve influences interest rates.
+multilingual	Traduce al inglés y explica el significado: "Más vale pájaro en mano que ciento volando."
+multilingual	Écris un court paragraphe en français sur l'importance du sommeil pour les étudiants.
+multilingual	请用中文解释什么是机器学习，并举一个日常生活中的例子。
+multilingual	日本の四季について、それぞれの季節の特徴を簡単に説明してください。

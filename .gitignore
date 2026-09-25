@@ -1,0 +1,13 @@
+llama.cpp/
+models/
+data/
+results/
+logs/
+dist/
+build/
+build-*/
+__pycache__/
+.venv/
+*.o
+expert-logger/expert-logger
+.DS_Store
