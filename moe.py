@@ -14,6 +14,7 @@ sizes the caches to fit, and starts llama.cpp with moe-stream turned on.
 """
 
 import argparse
+import math
 import ctypes
 import os
 import platform
@@ -38,6 +39,15 @@ GB = 1e9
 MARGIN_GB = 1.0          # left free so the machine stays usable
 BASE_GB = 1.2            # llama.cpp's own buffers (-b 128, 4k context), measured
 MIN_EXPERT_CACHE_GB = 0.5
+# Small machines (under 5 GB free, e.g. 4 GB laptops): 2k context and batch 64 need ~0.5 GB of buffers (measured peak
+# 1.36 GB with a 0.3 GB cache and 0.8 GB of streamed weights, 35B, 4 GB VM), and every 100 MB matters. Leaving the
+# always-needed weights to the OS there is fragile (3.1 tok/s in one test, 0.4 in the app with its own process added),
+# so small machines stream them unless there is a clear surplus (slack 0.6). The 1 GB margin stays: with less than
+# ~1.3 GB truly free, the OS evicts llama.cpp's small mapped tensors and refaults them (0.6 tok/s at 0.45 GB free vs
+# 1.8 at 1.4 GB free, same model and VM).
+SMALL_RAM_GB = 5.0
+SMALL = {"margin": 1.0, "base": 0.5, "min_cache": 0.2, "slack": 0.6, "ctx": 2048, "batch": 64}
+BIG = {"margin": MARGIN_GB, "base": BASE_GB, "min_cache": MIN_EXPERT_CACHE_GB, "slack": 0.3, "ctx": 4096, "batch": 128}
 DRAFT_OVERHEAD_GB = 0.15 # helper model's context and buffers, on top of its file size
 # Speculative decoding: something cheap guesses a few tokens, the big model checks them in one pass. It only pays off
 # when the always-needed weights are streamed (one pass reads them once for several tokens); when they fit in RAM,
@@ -148,26 +158,27 @@ def cache_hit_estimate(fraction):
 # ---------------------------------------------------------------- plan
 
 def make_plan(info, ram_gb, drive, draft_gb=0.0):
-    budget = ram_gb - MARGIN_GB - BASE_GB - draft_gb
-    plan = {"budget_gb": budget}
+    k = SMALL if ram_gb < SMALL_RAM_GB else BIG
+    budget = ram_gb - k["margin"] - k["base"] - draft_gb
+    plan = {"budget_gb": budget, "ctx": k["ctx"], "batch": k["batch"], "small": k is SMALL}
     if budget <= 0:
-        return None, f"only {ram_gb:.1f} GB of RAM is free; close some programs (need at least ~{MARGIN_GB + BASE_GB + 1.5:.1f} GB)"
+        return None, f"only {ram_gb:.1f} GB of RAM is free; close some programs (need at least ~{k['margin'] + k['base'] + 1.2:.1f} GB)"
     dense_all = info["dense_gb"]
-    if budget >= dense_all + MIN_EXPERT_CACHE_GB + 0.3:
+    if budget >= dense_all + k["min_cache"] + k["slack"]:
         # the always-needed weights fit: leave them to the OS, the rest goes to the expert cache
         plan["dense_stream_gb"] = 0
-        plan["cache_gb"] = min(budget - dense_all - 0.3, info["expert_gb"])
+        plan["cache_gb"] = min(budget - dense_all - k["slack"], info["expert_gb"])
         plan["pregate"] = 6
         streamed_dense = 0
     else:
         # they don't fit: stream them too, with a small expert cache (what worked for the 122B on 8 GB)
-        plan["cache_gb"] = MIN_EXPERT_CACHE_GB
-        plan["dense_stream_gb"] = budget - MIN_EXPERT_CACHE_GB
+        plan["cache_gb"] = k["min_cache"]
+        plan["dense_stream_gb"] = budget - k["min_cache"]
         per_layer = info["dense_managed_gb"] / info["layers"]
         minimum = 4 * per_layer * 1.3 + (info["dense_managed_gb"] - per_layer * info["layers"]) + per_layer
         if plan["dense_stream_gb"] < minimum:
-            return None, (f"not enough free RAM: this model needs at least ~{minimum + MIN_EXPERT_CACHE_GB + BASE_GB + MARGIN_GB:.1f} GB "
-                          f"free, you have {ram_gb:.1f} GB")
+            need = math.ceil((minimum + k["min_cache"] + k["base"] + k["margin"] + draft_gb) * 10) / 10
+            return None, f"not enough free RAM: this model needs at least ~{need:.1f} GB free, you have {ram_gb:.1f} GB"
         plan["pregate"] = 0
         streamed_dense = max(0.0, info["dense_managed_gb"] - (plan["dense_stream_gb"] - 4 * per_layer * 1.3))
     hit = cache_hit_estimate(plan["cache_gb"] / max(info["expert_gb"], 1e-9))
@@ -232,7 +243,7 @@ def ensure_packed(info, packed, slim):
 HF = "https://huggingface.co"
 CATALOG = {
     "qwen3.5-35b": {
-        "about": "Qwen3.5 35B-A3B, Q5_K_M. Runs well on 8 GB laptops (~5-6 words/s on a normal NVMe).",
+        "about": "Qwen3.5 35B-A3B, Q5_K_M. ~5-8 words/s on 8 GB laptops, ~2 on 4 GB (normal NVMe).",
         "repo": "unsloth/Qwen3.5-35B-A3B-GGUF", "files": ["Qwen3.5-35B-A3B-Q5_K_M.gguf"], "gb": 26.2,
     },
     "qwen3.5-122b": {
@@ -434,19 +445,23 @@ def run(args):
     plan, err = make_plan(info, ram, drive)
     if err:
         sys.exit(f"can't run: {err}")
-    guess = bool(plan["dense_stream_gb"]) and args.draft != "none"
+    # guessing ahead costs RAM (the helper, or MTP's extra buffers); on small machines that RAM is worth more to the
+    # streamed weights (measured on a 4 GB VM: 0.6-1.3 tok/s with the helper vs 1.3-1.8 without)
+    guess = bool(plan["dense_stream_gb"]) and args.draft != "none" and not plan["small"]
     if guess and not info["mtp"] and not draft and info["arch"].startswith("qwen3") and not args.plan:
         # guessing ahead roughly doubles speed here; offer the small helper model
         print("tip:     a 0.5 GB helper model makes this model ~1.5-2x faster on this machine")
         if ask("  download it?", True, args.yes):
             draft = fetch(HELPER, models_dir() / "helper", True, "helper")
-    draft_gb = draft.stat().st_size / GB + DRAFT_OVERHEAD_GB if draft else 0.0
+    draft_gb = draft.stat().st_size / GB + DRAFT_OVERHEAD_GB if draft and guess else 0.0  # only reserve it if it's used
     if plan["dense_stream_gb"] and draft_gb:
         plan, err = make_plan(info, ram, drive, draft_gb)  # make room for the helper model
         if err:
             sys.exit(f"can't run: {err}")
     how = ("always-needed weights stay in RAM" if not plan["dense_stream_gb"] else
            f"always-needed weights streamed with a {plan['dense_stream_gb']:.1f} GB budget")
+    if plan["small"]:
+        print(f"small:   under {SMALL_RAM_GB:.0f} GB free, so a {plan['ctx']}-token conversation window and smaller buffers")
     print(f"plan:    {plan['cache_gb']:.1f} GB expert cache, {how}; ~{plan['read_per_token_gb']:.2f} GB read per token"
           + (f", expect roughly {plan['est_tok_s']:.1f} words/s" if plan["est_tok_s"] else ""))
     if guess and info["mtp"] and not draft:
@@ -476,7 +491,8 @@ def run(args):
         ensure_dense_packed(info, dense_packed)
         env["EXPERT_CACHE_DENSE_GB"] = f"{plan['dense_stream_gb']:.2f}"
         env["EXPERT_CACHE_DENSE_PACKED"] = str(dense_packed)
-    common = ["-m", str(first), "-ngl", "0", "--no-repack", "--no-op-offload", "-c", "4096", "-b", "128", "-ub", "128",
+    common = ["-m", str(first), "-ngl", "0", "--no-repack", "--no-op-offload", "-c", str(plan["ctx"]),
+              "-b", str(plan["batch"]), "-ub", str(plan["batch"]),
               "-t", str(args.threads), "-tb", str(os.cpu_count() or args.threads), "-n", str(args.n),
               "--no-warmup",  # warmup runs every expert once, which fills the small cache with junk
               "-rea", "on" if args.think else "off"]

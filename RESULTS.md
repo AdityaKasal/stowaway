@@ -509,6 +509,34 @@ per run (`vm/q122-test.sh`; tok/s):
   (~1.3 tok/s at 7 GB/s), 16 GB of RAM (always-needed weights stay in memory and the expert cache grows), or reading
   fewer bytes per token.
 
+## 19. 4 GB machines, and tuning the 8 GB split (2026-09-25)
+
+**Memory split for the 122B Q8 on 8 GB** (3 GB/s, `vm/split-test.sh`): expert cache + streamed always-needed weights of
+0.3+4.9, 0.5+4.7 (the default), 1.0+4.2, 1.5+3.7, 2.2+3.0, 1.2+4.7 and 0.5+5.4 GB all gave 0.4-0.6 tok/s, and the default
+is as good as any. The expert data read was identical (242.6 GB per run) for every cache size from 0.3 to 2.2 GB: one Q8
+token of the 122B needs 3.85 GB of experts, more than any cache that fits next to the dense weights, so nothing is
+reused. The drive ran at ~2.75 of its 3 GB/s. That is the floor for this machine.
+
+**The 35B on a 4 GB machine** (4 GB / 4 CPU / no swap VM, ~3.2 GB free, 3 GB/s; `vm/ram4-probe.sh`, `vm/ram4-app.sh`).
+The planner (sized for 8 GB: 1.0 GB margin + 1.2 GB of buffers) refused to run. Measured by hand with a 2k context and
+batch 64:
+
+| Setup | Peak process memory | Lowest free | tok/s |
+|---|---|---|---|
+| cache 0.3 + stream 0.8 | 1.36 GB | 2.0 GB | 1.3 |
+| cache 0.3 + stream 1.4 | 1.93 GB | 1.4 GB | 1.8 |
+| cache 0.5, dense left to the OS | (page cache) | | 3.1 |
+| cache 1.0, dense left to the OS | | | 0.5 (thrash) |
+
+Through the app, leaving the dense weights to the OS thrashed (0.4-0.5 tok/s) because the app's own process tips it
+over, and a larger stream budget that left only ~0.45 GB free also collapsed (0.6-0.7). With less than ~1.3 GB truly
+free, the OS evicts llama.cpp's small mapped tensors and refaults them. The planner's small-machine mode (under 5 GB
+free): 2k context, batch 64, 0.5 GB of buffers, 0.2 GB minimum cache, the 1 GB margin kept, always stream unless there
+is a clear surplus, and no helper model (its RAM is worth more to the streamed weights). Result through the app:
+**1.9-2.0 tok/s on all three prompts**, lowest free 1.2 GB, no OOM. Below ~2.1 GB free it declines instead of thrashing.
+A 4 GB Windows laptop (Windows itself uses ~2 GB) will usually have less than that free; a 4 GB Linux machine or
+Chromebook is the realistic target.
+
 ## What didn't work, and why
 
 - **Windows PrefetchVirtualMemory called inline** made things 3× slower (it blocks while walking the range). Moving

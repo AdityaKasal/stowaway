@@ -20,7 +20,7 @@ in your browser.
 
 | | 8 GB RAM, no GPU, typical laptop SSD (3 GB/s) |
 |---|---|
-| Qwen3.5-35B-A3B Q5 (26 GB download) | ~5-6 words per second |
+| Qwen3.5-35B-A3B Q5 (26 GB download) | ~5-8 words per second (~2 on a 4 GB machine) |
 | Qwen3.5-122B-A10B Q5 (92 GB download) | ~1 word per second |
 
 You need an SSD and about the model's size in free disk space, plus 10%. From a terminal:
