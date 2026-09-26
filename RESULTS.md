@@ -630,6 +630,18 @@ outputs are summed in, and so the rounding. The hook now writes scores so that t
 order, which makes a zero-swap run bit-identical. Re-measured Qwen 35B with the fix: bonus 1.0 KLD 0.028 / 93.3% same top
 token (was 0.029 / 93.1%), bonus 0.5 0.022 / 94.9%. The conclusions of sections 16 and 20 stand.
 
+## 23. Slower drives, and recommending a model for the machine (2026-09-25)
+
+The 8 GB VM with its disk capped at 550 MB/s (a SATA SSD), one story prompt each (`vm/sata-test.sh`): gpt-oss-20b
+1.9 tok/s, Qwen3.5-35B Q5 2.5, gpt-oss-120b 0.5. That's 22-30% of the NVMe (3 GB/s) speed for 18% of the bandwidth,
+because the RAM cache absorbs part of it.
+
+The app's menu and `stowaway list` now estimate each catalog model's speed on the machine they run on, interpolating
+these measurements by free RAM (4/8/16 GB machines) and by drive speed (measured on a model already downloaded, else
+assumed NVMe). They recommend the best model that fits on the disk and gives at least 3 words/s (about reading speed),
+or the fastest one if none does. With these numbers: 4 GB -> gpt-oss-20b, 8 GB -> Qwen3.5-35B (on NVMe or SATA),
+16 GB -> gpt-oss-120b. Enter picks the recommendation.
+
 ## What didn't work, and why
 - Sharing experts inside the helper's guess-checking batches (`MOE_BATCH_VERIFY=1`, 2-16 token batches; 122B Q8, 8 GB,
   3 GB/s, 3 prompts): answering 0.6/0.9/0.5 tok/s vs 0.6/0.8/0.5 without it. The batches only touch 15-26 experts

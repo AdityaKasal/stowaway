@@ -16,7 +16,8 @@ laptop gets about half this speed (see the table below).*
 
 Get the zip for your computer from [Releases](../../releases/latest) (Windows, Linux, Apple Silicon Mac or Intel Mac),
 unzip it, and double-click `stowaway`.
-Pick a model; it shows the download size and asks before downloading anything. After a one-time setup, a chat opens
+It shows how fast each model should run on your computer and recommends one; press Enter to take it. It shows the
+download size and asks before downloading anything. After a one-time setup, a chat opens
 in your browser.
 
 | | 8 GB RAM, no GPU, typical laptop SSD (3 GB/s) |

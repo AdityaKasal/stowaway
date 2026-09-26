@@ -32,7 +32,7 @@ if not FROZEN:
     sys.path.insert(0, str(HERE / "llama.cpp" / "gguf-py"))
 import gguf  # noqa: E402
 
-VERSION = "0.2.7"
+VERSION = "0.2.8"
 REPO = "AdityaKasal/stowaway"
 
 import pack_dense  # noqa: E402
@@ -290,19 +290,19 @@ def ensure_packed(info, packed, slim):
 HF = "https://huggingface.co"
 CATALOG = {
     "qwen3.5-35b": {
-        "about": "Qwen3.5 35B-A3B, Q5_K_M. ~5-8 words/s on 8 GB laptops, ~2 on 4 GB (normal NVMe).",
+        "about": "Qwen3.5 35B-A3B (Q5). A strong all-rounder.",
         "repo": "unsloth/Qwen3.5-35B-A3B-GGUF", "files": ["Qwen3.5-35B-A3B-Q5_K_M.gguf"], "gb": 26.2,
     },
     "gpt-oss-20b": {
-        "about": "OpenAI gpt-oss-20b (native MXFP4). ~7-9 words/s on 8 GB, ~2.4 on 4 GB (normal NVMe).",
+        "about": "OpenAI gpt-oss-20b. Small and quick; the one for 4 GB machines.",
         "repo": "ggml-org/gpt-oss-20b-GGUF", "files": ["gpt-oss-20b-MXFP4.gguf"], "gb": 12.1,
     },
     "gpt-oss-120b": {
-        "about": "OpenAI gpt-oss-120b (native MXFP4). The big model for 8 GB: ~2.3 words/s; even 4 GB: ~0.7.",
+        "about": "OpenAI gpt-oss-120b. A big model that is light per word.",
         "repo": "ggml-org/gpt-oss-120b-GGUF", "files": ["gpt-oss-120b-MXFP4.gguf"], "gb": 63.4,
     },
     "qwen3.5-122b": {
-        "about": "Qwen3.5 122B-A10B, Q5_K_M. ~1 word/s on 8 GB, ~1.5-2 on 16 GB (normal NVMe; use --fast on 16 GB).",
+        "about": "Qwen3.5 122B-A10B (Q5). The biggest; comfortable with 16 GB+.",
         "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
         "files": [f"Q5_K_M/Qwen3.5-122B-A10B-Q5_K_M-0000{i}-of-00003.gguf" for i in (1, 2, 3)], "gb": 91.5,
     },
@@ -403,25 +403,100 @@ def resolve_model(name, assume_yes, plan_only=False):
 
 
 def cmd_list():
-    print("models stowaway can download and run:\n")
+    speeds, best, ram, drive = recommend()
+    print(f"models stowaway can download and run (speeds for this computer: {ram:.1f} GB free"
+          + (f", drive ~{drive:.1f} GB/s" if drive else ", assuming a normal NVMe SSD") + "):\n")
     for name, e in CATALOG.items():
         here = (models_dir() / name / Path(e["files"][0]).name).exists()
-        print(f"  {name:14s} {e['gb']:5.1f} GB  {'(downloaded) ' if here else ''}{e['about']}")
+        sp = speeds.get(name)
+        speed = "doesn't fit here" if sp is None else ("too little memory" if sp < 0.2 else f"~{sp:.0f} words/s" if sp >= 1.5 else f"~{sp:.1f} words/s")
+        print(f"  {name:13s} {e['gb']:5.1f} GB  {speed:17s} {'(downloaded) ' if here else ''}{e['about']}"
+              + ("  <- recommended" if name == best else ""))
     print(f"\nmodels are stored in {models_dir()} (set MOE_HOME to change)")
     print("any other Mixture-of-Experts GGUF file works too: stowaway run path/to/model.gguf")
 
 
+# Measured words/s (RESULTS.md 15-22): 4 CPU cores, no GPU, NVMe capped at 3 GB/s, by free RAM (4, 8, 16 GB machines
+# have ~3.2, ~7.3, ~15.5 GB free), and the 8 GB machine's speed on a SATA SSD (0.55 GB/s) as a fraction of that.
+MEASURED = {
+    "qwen3.5-35b":  {"ram": [(2.1, 0.0), (3.2, 2.0), (7.3, 8.2), (15.5, 9.0)], "sata": 0.30},
+    "gpt-oss-20b":  {"ram": [(1.9, 0.0), (3.2, 2.4), (7.3, 8.0), (15.5, 9.0)], "sata": 0.24},
+    "gpt-oss-120b": {"ram": [(2.3, 0.0), (3.2, 0.7), (7.3, 2.3), (15.5, 3.0)], "sata": 0.22},
+    "qwen3.5-122b": {"ram": [(3.3, 0.0), (7.3, 0.7), (15.5, 1.7)], "sata": 0.20},
+}
+QUALITY = ["qwen3.5-122b", "gpt-oss-120b", "qwen3.5-35b", "gpt-oss-20b"]  # best first
+COMFORT = 3.0  # words/s: about reading speed
+
+
+def expected_speed(name, ram_gb, drive_gbps):
+    m = MEASURED.get(name)
+    if not m:
+        return None
+    pts = m["ram"]
+    if ram_gb <= pts[0][0]:
+        return 0.0
+    s = pts[-1][1]
+    for (r0, s0), (r1, s1) in zip(pts, pts[1:]):
+        if ram_gb <= r1:
+            s = s0 + (s1 - s0) * (ram_gb - r0) / (r1 - r0)
+            break
+    if drive_gbps:
+        r = m["sata"]
+        if drive_gbps < 0.55:
+            f = r * drive_gbps / 0.55
+        elif drive_gbps <= 3.0:
+            f = r + (1 - r) * (drive_gbps - 0.55) / (3.0 - 0.55)
+        else:
+            f = min(1.5, 1 + 0.5 * (drive_gbps - 3.0) / 3.0)
+        s *= f
+    return s
+
+
+def measured_drive():
+    """Drive speed from a model already on disk (packed experts or a .gguf), else None (not measured yet)."""
+    files = sorted(models_dir().rglob("*-experts-packed.bin")) + sorted(models_dir().rglob("*.gguf"))
+    for f in files:
+        try:
+            if f.stat().st_size > 1 << 30:
+                return drive_speed_gbps(f, seconds=1.0)
+        except OSError:
+            continue
+    return None
+
+
+def recommend():
+    """(name -> expected words/s or None if it doesn't fit, recommended name, free RAM, drive GB/s or None)."""
+    ram = available_ram_gb()
+    drive = measured_drive()
+    free = shutil.disk_usage(models_dir()).free / GB
+    speeds = {}
+    for name, e in CATALOG.items():
+        here = all((models_dir() / name / Path(f).name).exists() for f in e["files"])
+        fits = here or free >= e["gb"] * 1.1
+        speeds[name] = expected_speed(name, ram, drive or 3.0) if fits else None
+    runnable = [n for n in QUALITY if speeds.get(n)]
+    good = [n for n in runnable if speeds[n] >= COMFORT]
+    best = good[0] if good else (max(runnable, key=lambda n: speeds[n]) if runnable else None)
+    return speeds, best, ram, drive
+
+
 def menu():
-    """What you get when you double-click moe: pick a model and chat, no typing commands."""
+    """What you get when you double-click stowaway: pick a model and chat, no typing commands."""
     names = list(CATALOG)
     print("stowaway - run big AI models on an ordinary computer\n")
+    speeds, best, ram, drive = recommend()
+    print(f"this computer: {ram:.1f} GB of memory free" + (f", drive ~{drive:.1f} GB/s" if drive else "") + "\n")
     for i, name in enumerate(names, 1):
         e = CATALOG[name]
         here = (models_dir() / name / Path(e["files"][0]).name).exists()
-        print(f"  {i}. {name:14s} {e['gb']:5.1f} GB  {'(downloaded) ' if here else ''}{e['about']}")
-    print(f"\nmodels are stored in {models_dir()}")
+        sp = speeds.get(name)
+        speed = "doesn't fit here" if sp is None else ("too little memory" if sp < 0.2 else f"~{sp:.0f} words/s here" if sp >= 1.5 else f"~{sp:.1f} words/s here")
+        mark = "  <- recommended" if name == best else ""
+        print(f"  {i}. {name:13s} {e['gb']:5.1f} GB  {speed:18s} {'(downloaded) ' if here else ''}{e['about']}{mark}")
+    print(f"\nmodels are stored in {models_dir()}" + ("" if drive else " (speeds assume a normal NVMe SSD until one is downloaded)"))
+    default = names.index(best) + 1 if best else 1
     try:
-        pick = input(f"\nwhich model? [1-{len(names)}, Enter = 1] ").strip() or "1"
+        pick = input(f"\nwhich model? [1-{len(names)}, Enter = {default}] ").strip() or str(default)
         name = names[int(pick) - 1]
     except (ValueError, IndexError, EOFError):
         sys.exit("no model picked")
