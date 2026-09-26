@@ -98,6 +98,11 @@ jobs:
           echo "ENGINE=build/bin" >> $GITHUB_ENV
           echo "ENGINE_COMPAT=build-compat/bin" >> $GITHUB_ENV
 
+      - name: unit tests
+        run: |
+          python -m pip install -q numpy pyyaml pytest
+          python -m pytest tests -q
+
       - name: build the launcher
         run: |
           python -m pip install -q numpy pyyaml pyinstaller

@@ -169,7 +169,8 @@ def make_plan(info, ram_gb, drive, draft_gb=0.0):
     budget = ram_gb - k["margin"] - k["base"] - draft_gb
     plan = {"budget_gb": budget, "ctx": k["ctx"], "batch": k["batch"], "small": k is SMALL}
     if budget <= 0:
-        return None, f"only {ram_gb:.1f} GB of RAM is free; close some programs (need at least ~{k['margin'] + k['base'] + 1.2:.1f} GB)"
+        need = k["margin"] + k["base"] + k["min_cache"] + 0.4  # plus the smallest streaming budget
+        return None, f"not enough free RAM: only {ram_gb:.1f} GB is free; close some programs (need at least ~{need:.1f} GB)"
     dense_all = info["dense_gb"]
     if budget >= dense_all + k["min_cache"] + k["slack"]:
         # the always-needed weights fit: leave them to the OS, the rest goes to the expert cache
