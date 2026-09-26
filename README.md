@@ -31,7 +31,8 @@ in your browser.
 On a SATA SSD expect roughly a quarter to a third of the NVMe speed. The app estimates the speed of each model on your
 computer and recommends one.
 
-You need an SSD and about the model's size in free disk space, plus 10%. From a terminal:
+You need an SSD and about the model's size in free disk space, plus 10%. Short on space? Press `f` in the menu to keep
+models in another folder, such as a USB SSD. From a terminal:
 
 ```
 stowaway list                      models it can download

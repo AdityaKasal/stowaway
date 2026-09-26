@@ -32,7 +32,7 @@ if not FROZEN:
     sys.path.insert(0, str(HERE / "llama.cpp" / "gguf-py"))
 import gguf  # noqa: E402
 
-VERSION = "0.2.12"
+VERSION = "0.2.13"
 REPO = "AdityaKasal/stowaway"
 
 import pack_dense  # noqa: E402
@@ -318,10 +318,59 @@ CATALOG = {
 HELPER = {"repo": "unsloth/Qwen3.5-0.8B-GGUF", "files": ["Qwen3.5-0.8B-Q4_K_M.gguf"], "gb": 0.53}
 
 
+def config_path():
+    base = Path(os.environ.get("APPDATA", "")) if platform.system() == "Windows" and os.environ.get("APPDATA") \
+        else Path.home() / ".config"
+    return base / "stowaway" / "config.json"
+
+
+def load_config():
+    import json
+    try:
+        return json.loads(config_path().read_text())
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    import json
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(json.dumps(cfg, indent=2))
+
+
 def models_dir():
-    d = Path(os.environ.get("MOE_HOME", Path.home() / "moe-models"))
+    """Where models live: MOE_HOME if set, else the folder chosen in the menu (remembered), else ~/moe-models."""
+    d = Path(os.environ.get("MOE_HOME") or load_config().get("models_dir") or Path.home() / "moe-models")
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def choose_models_dir():
+    """Menu option: pick another folder for models (e.g. on a USB SSD). Returns True if it changed."""
+    print(f"\nmodels are stored in {models_dir()}")
+    try:
+        new = input("new folder (Enter to keep it): ").strip().strip('"')
+    except EOFError:
+        return False
+    if not new:
+        return False
+    d = Path(new).expanduser()
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        probe = d / ".stowaway-write-test"
+        probe.write_text("ok")
+        probe.unlink()
+    except OSError as e:
+        print(f"can't use {d}: {e}")
+        return False
+    if os.environ.get("MOE_HOME"):
+        print("note: MOE_HOME is set, which takes priority over this choice")
+    cfg = load_config()
+    cfg["models_dir"] = str(d.resolve())
+    save_config(cfg)
+    print(f"ok, models will be stored in {d.resolve()} ({shutil.disk_usage(d).free / GB:.0f} GB free there). "
+          "Models you already downloaded stay in the old folder; move them over if you want to keep using them.")
+    return True
 
 
 def ask(question, default_yes, assume_yes):
@@ -471,7 +520,7 @@ def cmd_list():
         speed = "doesn't fit here" if sp is None else ("too little memory" if sp < 0.2 else f"~{sp:.0f} words/s" if sp >= 1.5 else f"~{sp:.1f} words/s")
         print(f"  {name:13s} {e['gb']:5.1f} GB  {speed:17s} {'(downloaded) ' if here else ''}{e['about']}"
               + ("  <- recommended" if name == best else ""))
-    print(f"\nmodels are stored in {models_dir()} (set MOE_HOME to change)")
+    print(f"\nmodels are stored in {models_dir()} (to change it: double-click stowaway and press f, or set MOE_HOME)")
     print("any other Mixture-of-Experts GGUF file works too: stowaway run path/to/model.gguf")
 
 
@@ -557,7 +606,11 @@ def menu():
     print(f"\nmodels are stored in {models_dir()}" + ("" if drive else " (speeds assume a normal NVMe SSD until one is downloaded)"))
     default = names.index(best) + 1 if best else 1
     try:
-        pick = input(f"\nwhich model? [1-{len(names)}, Enter = {default}] ").strip() or str(default)
+        pick = input(f"\nwhich model? [1-{len(names)}, Enter = {default}, f = store models in another folder] ").strip() or str(default)
+        if pick.lower() == "f":
+            choose_models_dir()
+            print()
+            return menu()
         name = names[int(pick) - 1]
     except (ValueError, IndexError, EOFError):
         sys.exit("no model picked")
