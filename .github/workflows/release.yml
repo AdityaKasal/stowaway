@@ -26,6 +26,7 @@ jobs:
         include:
           - { name: windows, os: windows-2022 }
           - { name: linux, os: ubuntu-22.04 }
+          - { name: linux-arm64, os: ubuntu-22.04-arm }
           - { name: mac, os: macos-14 }
           - { name: mac-intel, os: macos-15-intel }
     runs-on: ${{ matrix.os }}
@@ -66,6 +67,18 @@ jobs:
           echo "ENGINE=build/bin" >> $GITHUB_ENV
           echo "ENGINE_COMPAT=build-compat/bin" >> $GITHUB_ENV
           echo "AVX instructions in the compat engine: $(objdump -d --no-show-raw-insn build-compat/bin/llama-cli | grep -c '%ymm')"
+
+      - name: build the engine (Linux ARM)
+        if: matrix.name == 'linux-arm64'
+        run: |
+          LD="-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"
+          cmake -S llama.cpp -B build $COMMON -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16 "$LD"
+          cmake --build build --target llama-cli llama-server -j 4
+          cmake -S llama.cpp -B build-compat $COMMON -DGGML_CPU_ARM_ARCH=armv8-a "$LD"
+          cmake --build build-compat --target llama-cli llama-server -j 4
+          echo "ENGINE=build/bin" >> $GITHUB_ENV
+          echo "ENGINE_COMPAT=build-compat/bin" >> $GITHUB_ENV
+          grep -m1 -i features /proc/cpuinfo
 
       - name: build the engine (Apple Silicon Mac)
         if: matrix.name == 'mac'

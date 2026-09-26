@@ -216,8 +216,16 @@ def cpu_has_fast_path():
     if os.environ.get("STOWAWAY_COMPAT"):
         return False
     machine = platform.machine().lower()
+    if machine in ("aarch64", "arm64") and platform.system() == "Linux":
+        # the Linux ARM build's normal engine needs ARMv8.2 dot-product and half-precision (Raspberry Pi 5, most ARM
+        # laptops and Chromebooks since ~2019); older chips (Raspberry Pi 4) get the compat engine
+        try:
+            feats = next(l for l in open("/proc/cpuinfo") if l.lower().startswith("features")).split()
+            return "asimddp" in feats and ("asimdhp" in feats or "fphp" in feats)
+        except Exception:
+            return True
     if machine not in ("x86_64", "amd64", "x64"):
-        return True  # Apple Silicon / ARM builds have no such split
+        return True  # Apple Silicon has no such split
     try:
         if platform.system() == "Windows":
             return bool(ctypes.windll.kernel32.IsProcessorFeaturePresent(40))  # PF_AVX2_INSTRUCTIONS_AVAILABLE
@@ -238,7 +246,7 @@ def find_bin(name, bin_dir):
         for d in ([Path(bin_dir)] if bin_dir else []) + [HERE]:
             if (d / "compat" / exe).exists():
                 if not getattr(find_bin, "_told", False):
-                    print("cpu:     this processor lacks AVX2, so using the compatible engine (works everywhere, slower)")
+                    print("cpu:     this processor lacks the newer instructions, so using the compatible engine (works everywhere, slower)")
                     find_bin._told = True
                 return d / "compat" / exe
     for d in ([Path(bin_dir)] if bin_dir else []) + [HERE, HERE / "llama.cpp" / "build" / "bin", HERE / "build" / "bin"]:

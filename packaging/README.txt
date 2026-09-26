@@ -43,4 +43,5 @@ FIRST RUN WARNINGS
   Mac: if it says the app can't be opened, run this once in Terminal from
        this folder:  xattr -dr com.apple.quarantine .
        (stowaway-mac is for Apple Silicon Macs, stowaway-mac-intel for Intel Macs.)
-  Linux: needs glibc 2.34+ (Ubuntu 22.04+, Debian 12+, Fedora 35+).
+  Linux: needs glibc 2.34+ (Ubuntu 22.04+, Debian 12+, Fedora 35+, Raspberry Pi OS 12+).
+  stowaway-linux-arm64 is for 64-bit ARM Linux: Raspberry Pi 5 (and 4, more slowly), ARM Chromebooks, ARM laptops.
