@@ -20,11 +20,11 @@ It shows how fast each model should run on your computer and recommends one; pre
 download size and asks before downloading anything. After a one-time setup, a chat opens
 in your browser.
 
-| Model (download) | 8 GB laptop, NVMe SSD: most memory free / a typical Windows laptop (~5 GB free) | 4 GB machine | 16 GB |
+| Model (download) | 8 GB machine, NVMe SSD: most memory free / ~5 GB free (a typical Windows laptop) | 4 GB machine | 16 GB |
 |---|---|---|---|
-| Qwen3.5-35B-A3B Q5 (26 GB) | ~8 / ~2.5 words per second | ~2 | ~9 |
-| OpenAI gpt-oss-20b (12 GB) | ~8 / ~3.5 | ~2.4 | ~9 |
-| OpenAI gpt-oss-120b (63 GB) | ~2.3 / ~1.2 | ~0.7 | ~3 |
+| Qwen3.5-35B-A3B Q5 (26 GB) | ~8 / ~2.5-3.5 words per second | ~2 | ~9 |
+| OpenAI gpt-oss-20b (12 GB) | ~8 / ~4.7 | ~2.4 | ~9 |
+| OpenAI gpt-oss-120b (63 GB) | ~2.3 / ~1.6 | ~0.7 | ~3 |
 | Qwen3.5-122B-A10B Q5 (92 GB) | ~0.7 / ~0.5 | | ~1.5-2 with `--fast` |
 
 On a SATA SSD expect roughly a quarter to a third of the NVMe speed. The app estimates the speed of each model on your

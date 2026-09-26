@@ -654,7 +654,8 @@ that pressure), story prompt (`pc/win-lowram*.ps1`):
 | ~5.2 GB | Qwen3.5-122B Q5 | 0.5 |
 | ~2.8 GB | Qwen3.5-35B Q5 | 1.2 |
 
-The planner's estimate for the 35B at 4.8 GB free was 2.6, close to the measured 2.4. The app's recommendation table
+The planner's estimate for the 35B at 4.8 GB free was 2.6, close to the measured 2.4. The same ~5 GB free on a
+6 GB Linux VM at 3 GB/s (`vm/five-gb.sh`): Qwen3.5-35B 3.5 tok/s, gpt-oss-20b 4.7, gpt-oss-120b 1.6. The app's recommendation table
 now has this point, and the README's "what to expect" says what a typical 8 GB Windows laptop gets, not only the
 roomier Linux numbers.
 
