@@ -14,7 +14,8 @@ laptop gets about half this speed (see the table below).*
 
 ## Download
 
-Get the zip for your computer from [Releases](../../releases/latest) (Windows, Linux, Apple Silicon Mac or Intel Mac),
+Get the zip for your computer from [Releases](../../releases/latest) (Windows, Linux, Apple Silicon Mac, Intel Mac, or ARM
+Linux such as a Raspberry Pi 5),
 unzip it, and double-click `stowaway`.
 It shows how fast each model should run on your computer and recommends one; press Enter to take it. It shows the
 download size and asks before downloading anything. After a one-time setup, a chat opens
