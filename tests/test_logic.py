@@ -83,7 +83,7 @@ def test_recommendation_by_machine():
 def test_small_machine_plan_streams_and_keeps_a_margin():
     info = {"dense_gb": 2.12, "dense_managed_gb": 2.0, "layers": 40, "expert_gb": 23.8, "active_expert_gb": 0.74}
     plan, err = moe.make_plan(info, 3.2, 3.0)
-    assert not err and plan["small"] and plan["dense_stream_gb"] > 0 and plan["ctx"] == 2048
+    assert not err and plan["small"] and plan["dense_stream_gb"] > 0 and plan["ctx"] == 3072
     plan, err = moe.make_plan(info, 1.5, 3.0)
     assert err and "not enough free RAM" in err
     plan, err = moe.make_plan(info, 7.3, 3.0)

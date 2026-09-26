@@ -694,6 +694,37 @@ disk, a sensible answer at 11.7 tok/s. It's the menu's default 35B now; Qwen3.5-
 shown to people who already have it, and a model already on disk that runs comfortably is recommended over starting a
 new download.
 
+## 27. Using the RAM the planner held back (2026-09-26)
+
+A GPU experiment (the 35B's always-needed weights on the PC's RTX 5060 Ti, experts streamed as usual, ~4.8 GB of RAM
+free) gave 7.4 tok/s against 2.3 CPU-only, but the GPU was only 6% busy (peak 37%, 2.7 GB of its memory, 20 W): the
+gain came from the RAM it freed for the expert cache (drive reads 43.5 -> 14.8 GB), not from compute. So the same
+gain should be possible on CPU by giving the cache the RAM the planner was keeping back (1 GB margin + 0.3-0.6 GB
+slack), and stowaway stays CPU-only.
+
+Cache size at ~4.8 GB free, Windows, 35B Q5, release engine (`pc/cache-probe.ps1`): 0.6 GB (old plan) 2.3 tok/s, 1.2 GB
+4.0, 1.8 GB 5.3 (lowest free 0.9 GB), 2.4 GB 5.5 (0.37 GB free, too close), 1.8 GB with `--fast` 7.3 (the GPU run's
+7.4, with no GPU). Reading experts through the OS file cache (`EXPERT_CACHE_BUFFERED=1`) was worse (1.9 and 2.9).
+gpt-oss-120b (`vm/g120-spec.sh`): ~5 GB free, 0.9 / 1.8 / 2.5 GB cache -> 1.5 / 1.6 / 2.4 tok/s (a cache under one
+token's worth of experts, 1.9 GB, reuses nothing); 8 GB, 3.0 / 4.0 / 4.8 GB -> 2.4 / 2.8 / 0.7. At 4.8 the cache
+pushed the always-needed weights out of RAM and speed collapsed, which sets the limit. The EAGLE3 guesser made it
+slower in every case (0.6-1.1): checking guesses needs more distinct experts, and when the drive is the bottleneck
+that costs more than the guesses save.
+
+Planner change: with the always-needed weights in RAM, the cache gets everything except the engine's buffers and
+`RESERVE_GB` = 0.8 GB; lean buffers (3,072-token window, batch 64) below 7 GB free. Streaming mode keeps its 1 GB margin
+(section 19). The app end to end (`vm/planner-check.sh`, `pc/planner-check.ps1`):
+
+| Machine | Model | v0.2.16 | v0.2.17 | v0.2.17 `--fast` |
+|---|---|---|---|---|
+| Windows, ~5 GB free, ~2 GB/s | Qwen3.5-35B | 2.4 | 4.9 | 7.2 |
+| 6 GB VM (5.3 free), 3 GB/s | Qwen3.6-35B | ~3.5 | 6.0-7.3 | 8.7 |
+| 6 GB VM | gpt-oss-120b | 1.5 | 1.7-2.0 | |
+| 8 GB VM (7.4 free) | Qwen3.6-35B | 8.2 | 8.7 | 9.6 |
+| 8 GB VM | gpt-oss-120b | 2.3 | 2.5-2.9 | |
+
+No OOM kills; lowest free memory stayed above 2.8 GB in the VMs.
+
 ## What didn't work, and why
 - Sharing experts inside the helper's guess-checking batches (`MOE_BATCH_VERIFY=1`, 2-16 token batches; 122B Q8, 8 GB,
   3 GB/s, 3 prompts): answering 0.6/0.9/0.5 tok/s vs 0.6/0.8/0.5 without it. The batches only touch 15-26 experts

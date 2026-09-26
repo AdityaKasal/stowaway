@@ -32,7 +32,7 @@ if not FROZEN:
     sys.path.insert(0, str(HERE / "llama.cpp" / "gguf-py"))
 import gguf  # noqa: E402
 
-VERSION = "0.2.16"
+VERSION = "0.2.17"
 REPO = "AdityaKasal/stowaway"
 
 import pack_dense  # noqa: E402
@@ -50,8 +50,9 @@ MIN_EXPERT_CACHE_GB = 0.5
 # so small machines stream them unless there is a clear surplus (slack 0.6). The 1 GB margin stays: with less than
 # ~1.3 GB truly free, the OS evicts llama.cpp's small mapped tensors and refaults them (0.6 tok/s at 0.45 GB free vs
 # 1.8 at 1.4 GB free, same model and VM).
-SMALL_RAM_GB = 5.0
-SMALL = {"margin": 1.0, "base": 0.5, "min_cache": 0.2, "slack": 0.6, "ctx": 2048, "batch": 64}
+SMALL_RAM_GB = 7.0  # below this: leaner buffers, so more of the RAM goes to the expert cache
+RESERVE_GB = 0.8  # kept truly free when the always-needed weights sit in RAM (measured, RESULTS.md 27)
+SMALL = {"margin": 1.0, "base": 0.6, "min_cache": 0.2, "slack": 0.6, "ctx": 3072, "batch": 64}
 BIG = {"margin": MARGIN_GB, "base": BASE_GB, "min_cache": MIN_EXPERT_CACHE_GB, "slack": 0.3, "ctx": 4096, "batch": 128}
 DRAFT_OVERHEAD_GB = 0.15 # helper model's context and buffers, on top of its file size
 # Speculative decoding: something cheap guesses a few tokens, the big model checks them in one pass. It only pays off
@@ -172,10 +173,14 @@ def make_plan(info, ram_gb, drive, draft_gb=0.0):
         need = k["margin"] + k["base"] + k["min_cache"] + 0.4  # plus the smallest streaming budget
         return None, f"not enough free RAM: only {ram_gb:.1f} GB is free; close some programs (need at least ~{need:.1f} GB)"
     dense_all = info["dense_gb"]
-    if budget >= dense_all + k["min_cache"] + k["slack"]:
-        # the always-needed weights fit: leave them to the OS, the rest goes to the expert cache
+    # The always-needed weights fit in RAM: they stay resident and the expert cache gets the rest, keeping only
+    # RESERVE_GB truly free. Measured limit (RESULTS.md 27): past it the cache pushes the always-needed weights out of
+    # memory and speed collapses (gpt-oss-120b on 8 GB: 2.8 words/s with a 4.0 GB cache, 0.7 with 4.8); below it every
+    # extra GB of cache pays (35B at ~4.8 GB free: 2.3 -> 5.3 words/s going from a 0.6 to a 1.8 GB cache).
+    in_ram_cache = ram_gb - k["base"] - RESERVE_GB - draft_gb - dense_all
+    if in_ram_cache >= k["min_cache"] and (k is BIG or in_ram_cache >= k["slack"]):
         plan["dense_stream_gb"] = 0
-        plan["cache_gb"] = min(budget - dense_all - k["slack"], info["expert_gb"])
+        plan["cache_gb"] = min(in_ram_cache, info["expert_gb"])
         plan["pregate"] = 6
         streamed_dense = 0
     else:
@@ -560,10 +565,11 @@ def cmd_list():
 MEASURED = {
     # ~5 GB free is a real 8 GB Windows laptop: measured on a 6 GB Linux VM at 3 GB/s (35B 3.5, gpt-oss-20b 4.7,
     # gpt-oss-120b 1.6) and on Windows at ~2 GB/s (35B 2.4)
-    "qwen3.6-35b":  {"ram": [(2.1, 0.0), (3.2, 2.0), (5.2, 3.5), (7.3, 8.2), (15.5, 8.5)], "sata": 0.30},  # same layout as 3.5
-    "qwen3.5-35b":  {"ram": [(2.1, 0.0), (3.2, 2.0), (5.2, 3.5), (7.3, 8.2), (15.5, 8.5)], "sata": 0.30},
+    # v0.2.17 planner (RESULTS.md 27): 5.2 GB free 6.0-7.3 (VM) / 4.9 at ~2 GB/s (Windows); 7.3 GB free 8.7
+    "qwen3.6-35b":  {"ram": [(2.1, 0.0), (3.2, 2.0), (5.2, 6.5), (7.3, 8.7), (15.5, 8.5)], "sata": 0.30},  # same layout as 3.5
+    "qwen3.5-35b":  {"ram": [(2.1, 0.0), (3.2, 2.0), (5.2, 6.5), (7.3, 8.7), (15.5, 8.5)], "sata": 0.30},
     "gpt-oss-20b":  {"ram": [(1.9, 0.0), (3.2, 2.4), (5.2, 4.7), (7.3, 8.0), (15.5, 14.1)], "sata": 0.24},
-    "gpt-oss-120b": {"ram": [(2.3, 0.0), (3.2, 0.7), (5.2, 1.6), (7.3, 2.3), (15.5, 4.1)], "sata": 0.22},
+    "gpt-oss-120b": {"ram": [(2.3, 0.0), (3.2, 0.7), (5.2, 1.8), (7.3, 2.7), (15.5, 4.1)], "sata": 0.22},
     "qwen3.5-122b": {"ram": [(3.3, 0.0), (5.2, 0.5), (7.3, 0.7), (15.5, 1.7)], "sata": 0.20},
 }
 QUALITY = ["qwen3.5-122b", "gpt-oss-120b", "qwen3.6-35b", "qwen3.5-35b", "gpt-oss-20b"]  # best first
@@ -839,7 +845,7 @@ def run(args):
     how = ("always-needed weights stay in RAM" if not plan["dense_stream_gb"] else
            f"always-needed weights streamed with a {plan['dense_stream_gb']:.1f} GB budget")
     if plan["small"]:
-        print(f"small:   under {SMALL_RAM_GB:.0f} GB free, so a {plan['ctx']}-token conversation window and smaller buffers")
+        print(f"small:   under {SMALL_RAM_GB:.0f} GB free, so a {plan['ctx']}-token conversation window and leaner buffers")
     print(f"plan:    {plan['cache_gb']:.1f} GB expert cache, {how}; ~{plan['read_per_token_gb']:.2f} GB read per token"
           + (f", expect roughly {plan['est_tok_s']:.1f} words/s" if plan["est_tok_s"] else ""))
     if guess and info["mtp"] and not draft:

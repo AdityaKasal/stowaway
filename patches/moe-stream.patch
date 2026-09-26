@@ -31,10 +31,10 @@ index d8319cd..7eb83f7 100644
      }
 diff --git a/common/moe-stream.h b/common/moe-stream.h
 new file mode 100644
-index 0000000..c87bde7
+index 0000000..38c71e1
 --- /dev/null
 +++ b/common/moe-stream.h
-@@ -0,0 +1,1944 @@
+@@ -0,0 +1,1949 @@
 +// moe-stream: run Mixture-of-Experts models that are much bigger than RAM (moe-router-study).
 +//
 +// - expert_cache: keeps recently used experts in a fixed block of RAM and reads missing ones straight from the model
@@ -1051,6 +1051,7 @@ index 0000000..c87bde7
 +    }
 +
 +    size_t chunk_bytes = 4 << 20; // read size; whole experts (4 MB) beat smaller chunks on the PC SSD, same on the Mac
++    bool buffered_reads = getenv("EXPERT_CACHE_BUFFERED") != nullptr;
 +
 +    void io_loop() {
 +        // own handles per thread: Windows serializes synchronous I/O on a shared handle
@@ -1059,8 +1060,10 @@ index 0000000..c87bde7
 +        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 +        std::vector<HANDLE> fh;
 +        for (auto & p : paths) {
++            // EXPERT_CACHE_BUFFERED=1: go through the OS file cache, so free RAM the planner leaves as a safety margin
++            // doubles as a second-level expert cache (the OS hands it back to other programs whenever they need it)
 +            fh.push_back(CreateFileA(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-+                                     FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS, nullptr));
++                                     (buffered_reads ? 0 : FILE_FLAG_NO_BUFFERING) | FILE_FLAG_RANDOM_ACCESS, nullptr));
 +        }
 +#else
 +        std::vector<int> fh;
@@ -1068,7 +1071,7 @@ index 0000000..c87bde7
 +#ifdef __linux__
 +            // Linux: skip the page cache so reads don't also fill RAM with a second copy (all our offsets, sizes and
 +            // buffers are 4 KB aligned); fall back to normal reads if the filesystem refuses O_DIRECT
-+            int fd = open(p.c_str(), O_RDONLY | O_DIRECT);
++            int fd = buffered_reads ? -1 : open(p.c_str(), O_RDONLY | O_DIRECT);
 +            if (fd < 0) {
 +                fd = open(p.c_str(), O_RDONLY);
 +            }
@@ -1076,7 +1079,9 @@ index 0000000..c87bde7
 +            const int fd = open(p.c_str(), O_RDONLY);
 +#endif
 +#ifdef F_NOCACHE
-+            fcntl(fd, F_NOCACHE, 1); // macOS: don't also keep a copy in the OS file cache
++            if (!buffered_reads) {
++                fcntl(fd, F_NOCACHE, 1); // macOS: don't also keep a copy in the OS file cache
++            }
 +#endif
 +            fh.push_back(fd);
 +        }
