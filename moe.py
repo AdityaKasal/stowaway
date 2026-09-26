@@ -32,7 +32,7 @@ if not FROZEN:
     sys.path.insert(0, str(HERE / "llama.cpp" / "gguf-py"))
 import gguf  # noqa: E402
 
-VERSION = "0.2.8"
+VERSION = "0.2.9"
 REPO = "AdityaKasal/stowaway"
 
 import pack_dense  # noqa: E402
@@ -419,8 +419,10 @@ def cmd_list():
 # Measured words/s (RESULTS.md 15-22): 4 CPU cores, no GPU, NVMe capped at 3 GB/s, by free RAM (4, 8, 16 GB machines
 # have ~3.2, ~7.3, ~15.5 GB free), and the 8 GB machine's speed on a SATA SSD (0.55 GB/s) as a fraction of that.
 MEASURED = {
-    "qwen3.5-35b":  {"ram": [(2.1, 0.0), (3.2, 2.0), (7.3, 8.2), (15.5, 9.0)], "sata": 0.30},
-    "gpt-oss-20b":  {"ram": [(1.9, 0.0), (3.2, 2.4), (7.3, 8.0), (15.5, 9.0)], "sata": 0.24},
+    # 4.8 GB free is a real 8 GB Windows laptop (measured on Windows: 2.4 words/s at ~2 GB/s -> 3.4 at 3 GB/s);
+    # gpt-oss-20b's point there is scaled from the 35B's (not measured)
+    "qwen3.5-35b":  {"ram": [(2.1, 0.0), (3.2, 2.0), (4.8, 3.4), (7.3, 8.2), (15.5, 9.0)], "sata": 0.30},
+    "gpt-oss-20b":  {"ram": [(1.9, 0.0), (3.2, 2.4), (4.8, 3.6), (7.3, 8.0), (15.5, 9.0)], "sata": 0.24},
     "gpt-oss-120b": {"ram": [(2.3, 0.0), (3.2, 0.7), (7.3, 2.3), (15.5, 3.0)], "sata": 0.22},
     "qwen3.5-122b": {"ram": [(3.3, 0.0), (7.3, 0.7), (15.5, 1.7)], "sata": 0.20},
 }

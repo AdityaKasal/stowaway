@@ -642,6 +642,22 @@ assumed NVMe). They recommend the best model that fits on the disk and gives at 
 or the fastest one if none does. With these numbers: 4 GB -> gpt-oss-20b, 8 GB -> Qwen3.5-35B (on NVMe or SATA),
 16 GB -> gpt-oss-120b. Enter picks the recommendation.
 
+## 24. The Windows app on a realistic 8 GB laptop (2026-09-25)
+
+A real 8 GB Windows laptop has ~4.5-5 GB free, not the ~7.3 GB of the Linux VM. The released v0.2.8 Windows zip on the
+PC, with `pc/ram_limit.py` locking memory away until ~4.5 GB was left, experts on the E: SSD (measured ~2 GB/s under
+that pressure), story prompt (`pc/win-lowram*.ps1`):
+
+| Free memory | Model | tok/s |
+|---|---|---|
+| ~4.8-5.1 GB | Qwen3.5-35B Q5 | 2.4 (4 runs, both the default plan and forced small-machine mode) |
+| ~5.2 GB | Qwen3.5-122B Q5 | 0.5 |
+| ~2.8 GB | Qwen3.5-35B Q5 | 1.2 |
+
+The planner's estimate for the 35B at 4.8 GB free was 2.6, close to the measured 2.4. The app's recommendation table
+now has this point, and the README's "what to expect" says what a typical 8 GB Windows laptop gets, not only the
+roomier Linux numbers.
+
 ## What didn't work, and why
 - Sharing experts inside the helper's guess-checking batches (`MOE_BATCH_VERIFY=1`, 2-16 token batches; 122B Q8, 8 GB,
   3 GB/s, 3 prompts): answering 0.6/0.9/0.5 tok/s vs 0.6/0.8/0.5 without it. The batches only touch 15-26 experts
