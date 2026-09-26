@@ -32,7 +32,7 @@ if not FROZEN:
     sys.path.insert(0, str(HERE / "llama.cpp" / "gguf-py"))
 import gguf  # noqa: E402
 
-VERSION = "0.2.11"
+VERSION = "0.2.12"
 REPO = "AdityaKasal/stowaway"
 
 import pack_dense  # noqa: E402
@@ -392,8 +392,59 @@ def fetch(entry, into, assume_yes, what):
         sys.exit("ok, not downloading")
     into.mkdir(parents=True, exist_ok=True)
     for f, p in missing:
-        download(f"{HF}/{entry['repo']}/resolve/main/{f}", p)
+        url = f"{HF}/{entry['repo']}/resolve/main/{f}"
+        expected = hf_checksum(entry["repo"], f)
+        for attempt in (1, 2):
+            download(url, p)
+            ok, why = verify_download(p, expected)
+            if ok:
+                break
+            p.unlink(missing_ok=True)
+            if attempt == 2:
+                sys.exit(f"{p.name} arrived damaged twice ({why}). Check your internet connection and disk, then try again.")
+            print(f"  {p.name} arrived damaged ({why}); downloading it again", flush=True)
     return paths[0]
+
+
+def hf_checksum(repo, path):
+    """(size, sha256) Hugging Face publishes for a file, or None if it can't be fetched (then we skip the check)."""
+    import json
+    import urllib.request
+    folder = path.rsplit("/", 1)[0] if "/" in path else ""
+    try:
+        req = urllib.request.Request(f"{HF}/api/models/{repo}/tree/main/{folder}".rstrip("/"),
+                                     headers={"User-Agent": f"stowaway/{VERSION}"})
+        for f in json.load(urllib.request.urlopen(req, timeout=15)):
+            if f.get("path") == path:
+                lfs = f.get("lfs") or {}
+                return int(lfs.get("size") or f.get("size")), lfs.get("oid")
+    except Exception:
+        pass
+    return None
+
+
+def verify_download(p, expected):
+    """Check a fresh download against Hugging Face's size and SHA-256, before anything modifies it (slim packing does)."""
+    if not expected:
+        print("  (couldn't get the file's checksum from Hugging Face, so skipping the integrity check)")
+        return True, ""
+    size, sha = expected
+    have = p.stat().st_size
+    if have != size:
+        return False, f"size {have} instead of {size} bytes"
+    if not sha:
+        return True, ""
+    import hashlib
+    h, done, last = hashlib.sha256(), 0, 0.0
+    with open(p, "rb") as f:
+        while chunk := f.read(16 << 20):
+            h.update(chunk)
+            done += len(chunk)
+            if time.time() - last > 2:
+                last = time.time()
+                print(f"\r  checking the download: {100 * done / size:.0f}%   ", end="", flush=True)
+    print("\r  checking the download: done" + " " * 10, flush=True)
+    return (True, "") if h.hexdigest() == sha else (False, "its checksum doesn't match Hugging Face's")
 
 
 def resolve_model(name, assume_yes, plan_only=False):
