@@ -32,11 +32,12 @@ if not FROZEN:
     sys.path.insert(0, str(HERE / "llama.cpp" / "gguf-py"))
 import gguf  # noqa: E402
 
-VERSION = "0.2.15"
+VERSION = "0.2.16"
 REPO = "AdityaKasal/stowaway"
 
 import pack_dense  # noqa: E402
 import repack_experts  # noqa: E402
+import sparse  # noqa: E402
 import streampack  # noqa: E402
 
 GB = 1e9
@@ -634,6 +635,62 @@ def recommend():
     return speeds, best, ram, drive
 
 
+def downloaded_models():
+    """[(name, GB on disk, folder)] for catalog models present in the models folder."""
+    out = []
+    for name in CATALOG:
+        d = models_dir() / name
+        if d.is_dir() and any(d.iterdir()):
+            size = sum(sparse.allocated(f) for f in d.rglob("*") if f.is_file()) / GB
+            out.append((name, size, d))
+    return out
+
+
+def delete_model():
+    """Menu option: remove a downloaded model's folder after the user confirms."""
+    have = downloaded_models()
+    if not have:
+        print("\nno downloaded models to delete")
+        return
+    print()
+    for i, (name, size, d) in enumerate(have, 1):
+        print(f"  {i}. {name:13s} {size:6.1f} GB  ({d})")
+    try:
+        pick = input("\ndelete which one? (number, Enter = cancel) ").strip()
+        if not pick:
+            return
+        name, size, d = have[int(pick) - 1]
+        if input(f"permanently delete {name} ({size:.1f} GB)? type yes to confirm: ").strip().lower() != "yes":
+            print("not deleted")
+            return
+    except (ValueError, IndexError, EOFError):
+        print("not deleted")
+        return
+    shutil.rmtree(d)
+    print(f"deleted {name}; {shutil.disk_usage(models_dir()).free / GB:.0f} GB free now")
+
+
+def write_report(problem):
+    """Save a short plain-text report (no personal files, just the machine and the error) next to the models."""
+    try:
+        lines = [f"stowaway {VERSION} report, {time.strftime('%Y-%m-%d %H:%M')}", f"problem: {problem}", "",
+                 f"system: {platform.system()} {platform.release()} {platform.machine()}",
+                 f"processor: {platform.processor() or '?'}; fast engine usable: {cpu_has_fast_path()}",
+                 f"memory free: {available_ram_gb():.1f} GB",
+                 f"models folder: {models_dir()} ({shutil.disk_usage(models_dir()).free / GB:.0f} GB free)"]
+        for name, size, _ in downloaded_models():
+            lines.append(f"model: {name} ({size:.1f} GB on disk)")
+        logs = sorted((models_dir() / "logs").glob("*.log"), key=lambda p: p.stat().st_mtime)
+        if logs:
+            tail = logs[-1].read_text(encoding="utf-8", errors="replace").splitlines()[-60:]
+            lines += ["", f"last lines of {logs[-1].name}:"] + tail
+        path = models_dir() / "stowaway-report.txt"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+    except Exception:
+        return None
+
+
 def menu():
     """What you get when you double-click stowaway: pick a model and chat, no typing commands."""
     names = [n for n in CATALOG if visible(n)]
@@ -650,9 +707,14 @@ def menu():
     print(f"\nmodels are stored in {models_dir()}" + ("" if drive else " (speeds assume a normal NVMe SSD until one is downloaded)"))
     default = names.index(best) + 1 if best else 1
     try:
-        pick = input(f"\nwhich model? [1-{len(names)}, Enter = {default}, f = store models in another folder] ").strip() or str(default)
+        pick = input(f"\nwhich model? [1-{len(names)}, Enter = {default}, f = store models in another folder, "
+                     f"d = delete a downloaded model] ").strip() or str(default)
         if pick.lower() == "f":
             choose_models_dir()
+            print()
+            return menu()
+        if pick.lower() == "d":
+            delete_model()
             print()
             return menu()
         name = names[int(pick) - 1]
@@ -664,6 +726,9 @@ def menu():
     except SystemExit as e:
         if e.code not in (None, 0):
             print(e.code)
+            path = write_report(str(e.code))
+            if path:
+                print(f"\nA short report about this was saved to:\n  {path}\nSend that file to whoever helps you with stowaway.")
             input("\npress Enter to close")
             sys.exit(1)
         raise
