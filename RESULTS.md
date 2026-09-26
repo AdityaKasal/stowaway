@@ -684,6 +684,16 @@ zeros and so allocates everything, even for a sparse file (1 GB allocated after 
 `SetFilePointerEx` + `SetEndOfFile` after marking them sparse. That also affected the old packing path on Windows,
 which was writing zeros over the whole packed file before the real data (85-123 GB for the big models); fixed too.
 
+## 26. Qwen3.6-35B-A3B becomes the default (2026-09-26)
+
+Qwen3.6-35B-A3B (April 2026, `unsloth/Qwen3.6-35B-A3B-GGUF`, UD-Q5_K_M, 26.5 GB) has exactly the Qwen3.5-35B layout
+(read from its header: `qwen35moe`, 256 experts, 8 per token, 40 layers, 23.8 GB of experts, 2.14 GB always-needed),
+so it runs at the same speed; the estimate table reuses the 35B measurements. End to end through the app in the VM
+(`vm/qwen36.sh`): downloaded straight into the packed layout in 842 s including the answer, no setup step, 25.6 GB on
+disk, a sensible answer at 11.7 tok/s. It's the menu's default 35B now; Qwen3.5-35B stays in the catalog but is only
+shown to people who already have it, and a model already on disk that runs comfortably is recommended over starting a
+new download.
+
 ## What didn't work, and why
 - Sharing experts inside the helper's guess-checking batches (`MOE_BATCH_VERIFY=1`, 2-16 token batches; 122B Q8, 8 GB,
   3 GB/s, 3 prompts): answering 0.6/0.9/0.5 tok/s vs 0.6/0.8/0.5 without it. The batches only touch 15-26 experts

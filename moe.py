@@ -32,7 +32,7 @@ if not FROZEN:
     sys.path.insert(0, str(HERE / "llama.cpp" / "gguf-py"))
 import gguf  # noqa: E402
 
-VERSION = "0.2.14"
+VERSION = "0.2.15"
 REPO = "AdityaKasal/stowaway"
 
 import pack_dense  # noqa: E402
@@ -298,8 +298,12 @@ def ensure_packed(info, packed, slim):
 
 HF = "https://huggingface.co"
 CATALOG = {
+    "qwen3.6-35b": {
+        "about": "Qwen3.6 35B-A3B (Q5). A strong all-rounder; newer than 3.5.",
+        "repo": "unsloth/Qwen3.6-35B-A3B-GGUF", "files": ["Qwen3.6-35B-A3B-UD-Q5_K_M.gguf"], "gb": 26.5,
+    },
     "qwen3.5-35b": {
-        "about": "Qwen3.5 35B-A3B (Q5). A strong all-rounder.",
+        "about": "Qwen3.5 35B-A3B (Q5). The previous version; shown only if you already have it.", "hidden_unless_downloaded": True,
         "repo": "unsloth/Qwen3.5-35B-A3B-GGUF", "files": ["Qwen3.5-35B-A3B-Q5_K_M.gguf"], "gb": 26.2,
     },
     "gpt-oss-20b": {
@@ -538,7 +542,7 @@ def cmd_list():
     print(f"models stowaway can download and run (speeds for this computer: {ram:.1f} GB free"
           + (f", drive ~{drive:.1f} GB/s" if drive else ", assuming a normal NVMe SSD") + "):\n")
     for name, e in CATALOG.items():
-        if e.get("hidden"):
+        if not visible(name):
             continue
         here = (models_dir() / name / Path(e["files"][0]).name).exists()
         sp = speeds.get(name)
@@ -554,13 +558,24 @@ def cmd_list():
 MEASURED = {
     # ~5 GB free is a real 8 GB Windows laptop: measured on a 6 GB Linux VM at 3 GB/s (35B 3.5, gpt-oss-20b 4.7,
     # gpt-oss-120b 1.6) and on Windows at ~2 GB/s (35B 2.4)
+    "qwen3.6-35b":  {"ram": [(2.1, 0.0), (3.2, 2.0), (5.2, 3.5), (7.3, 8.2), (15.5, 8.5)], "sata": 0.30},  # same layout as 3.5
     "qwen3.5-35b":  {"ram": [(2.1, 0.0), (3.2, 2.0), (5.2, 3.5), (7.3, 8.2), (15.5, 8.5)], "sata": 0.30},
     "gpt-oss-20b":  {"ram": [(1.9, 0.0), (3.2, 2.4), (5.2, 4.7), (7.3, 8.0), (15.5, 14.1)], "sata": 0.24},
     "gpt-oss-120b": {"ram": [(2.3, 0.0), (3.2, 0.7), (5.2, 1.6), (7.3, 2.3), (15.5, 4.1)], "sata": 0.22},
     "qwen3.5-122b": {"ram": [(3.3, 0.0), (5.2, 0.5), (7.3, 0.7), (15.5, 1.7)], "sata": 0.20},
 }
-QUALITY = ["qwen3.5-122b", "gpt-oss-120b", "qwen3.5-35b", "gpt-oss-20b"]  # best first
+QUALITY = ["qwen3.5-122b", "gpt-oss-120b", "qwen3.6-35b", "qwen3.5-35b", "gpt-oss-20b"]  # best first
 COMFORT = 3.0  # words/s: about reading speed
+
+
+def visible(name):
+    """Catalog entries shown in the menu and list: not the hidden test model, and old versions only if downloaded."""
+    e = CATALOG[name]
+    if e.get("hidden"):
+        return False
+    if e.get("hidden_unless_downloaded"):
+        return all((models_dir() / name / Path(f).name).exists() for f in e["files"])
+    return True
 
 
 def expected_speed(name, ram_gb, drive_gbps):
@@ -606,20 +621,22 @@ def recommend():
     free = shutil.disk_usage(models_dir()).free / GB
     speeds = {}
     for name, e in CATALOG.items():
-        if e.get("hidden"):
+        if not visible(name):
             continue
         here = all((models_dir() / name / Path(f).name).exists() for f in e["files"])
         fits = here or free >= e["gb"] * 1.1
         speeds[name] = expected_speed(name, ram, drive or 3.0) if fits else None
     runnable = [n for n in QUALITY if speeds.get(n)]
     good = [n for n in runnable if speeds[n] >= COMFORT]
-    best = good[0] if good else (max(runnable, key=lambda n: speeds[n]) if runnable else None)
+    have = [n for n in good if all((models_dir() / n / Path(f).name).exists() for f in CATALOG[n]["files"])]
+    # a model already on disk that runs comfortably beats starting another big download
+    best = have[0] if have else good[0] if good else (max(runnable, key=lambda n: speeds[n]) if runnable else None)
     return speeds, best, ram, drive
 
 
 def menu():
     """What you get when you double-click stowaway: pick a model and chat, no typing commands."""
-    names = [n for n, e in CATALOG.items() if not e.get("hidden")]
+    names = [n for n in CATALOG if visible(n)]
     print("stowaway - run big AI models on an ordinary computer\n")
     speeds, best, ram, drive = recommend()
     print(f"this computer: {ram:.1f} GB of memory free" + (f", drive ~{drive:.1f} GB/s" if drive else "") + "\n")
