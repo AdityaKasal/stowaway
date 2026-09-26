@@ -80,3 +80,34 @@ def punch(path, ranges):
     else:
         raise OSError(f"punching holes isn't supported on {system}")
     return max(0, before - allocated(path))
+
+
+def make_sparse_file(path, size):
+    """Create an empty file of `size` bytes that takes no disk space until written. On Windows the file is marked
+    sparse first; otherwise NTFS would zero-fill up to wherever the first write lands (doubling the writes)."""
+    path = str(path)
+    with open(path, "wb"):
+        pass
+    if platform.system() == "Windows":
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                        ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        h = k32.CreateFileW(path, 0x80000000 | 0x40000000, 0x1 | 0x2 | 0x4, None, 3, 0x80, None)
+        if h in (None, wintypes.HANDLE(-1).value):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            got = wintypes.DWORD(0)
+            if not k32.DeviceIoControl(h, 0x000900C4, None, 0, None, 0, ctypes.byref(got), None):  # FSCTL_SET_SPARSE
+                raise ctypes.WinError(ctypes.get_last_error())
+            # set the size with the Windows API: Python's truncate() goes through the C runtime's _chsize, which
+            # writes zeros into the extension and so allocates the whole file (measured: 1 GB for one 4 KB write)
+            k32.SetFilePointerEx.argtypes = [wintypes.HANDLE, ctypes.c_int64, ctypes.c_void_p, wintypes.DWORD]
+            if not k32.SetFilePointerEx(h, size, None, 0) or not k32.SetEndOfFile(h):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            k32.CloseHandle(h)
+        return
+    with open(path, "r+b") as f:
+        f.truncate(size)

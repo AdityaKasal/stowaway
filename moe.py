@@ -32,11 +32,12 @@ if not FROZEN:
     sys.path.insert(0, str(HERE / "llama.cpp" / "gguf-py"))
 import gguf  # noqa: E402
 
-VERSION = "0.2.13"
+VERSION = "0.2.14"
 REPO = "AdityaKasal/stowaway"
 
 import pack_dense  # noqa: E402
 import repack_experts  # noqa: E402
+import streampack  # noqa: E402
 
 GB = 1e9
 MARGIN_GB = 1.0          # left free so the machine stays usable
@@ -309,6 +310,10 @@ CATALOG = {
         "about": "OpenAI gpt-oss-120b. A big model that is light per word.",
         "repo": "ggml-org/gpt-oss-120b-GGUF", "files": ["gpt-oss-120b-MXFP4.gguf"], "gb": 63.4,
     },
+    "test-tiny": {  # a 39 MB MoE used by the automated tests; not shown in the menu or list
+        "about": "tiny test model", "repo": "ggml-org/stories15M_MOE", "files": ["stories15M_MOE-Q8_0.gguf"],
+        "gb": 0.04, "hidden": True,
+    },
     "qwen3.5-122b": {
         "about": "Qwen3.5 122B-A10B (Q5). The biggest; comfortable with 16 GB+.",
         "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
@@ -440,6 +445,18 @@ def fetch(entry, into, assume_yes, what):
     if not ask(f"  download {entry['gb']:.1f} GB now?", what != "model", assume_yes):
         sys.exit("ok, not downloading")
     into.mkdir(parents=True, exist_ok=True)
+    if what == "model" and len(missing) == len(paths):
+        # download straight into the packed layout: one write per byte, no separate packing step afterwards
+        try:
+            expected = [hf_checksum(entry["repo"], f) for f in entry["files"]]
+            first = streampack.fetch_packed(entry["repo"], entry["files"], into, default_packed(paths[0]), expected,
+                                            f"stowaway/{VERSION}")
+            if first:
+                return first
+        except SystemExit:
+            raise
+        except Exception as e:  # anything unexpected about the file: fall back to download-then-pack
+            print(f"  (downloading the plain way: {e})", flush=True)
     for f, p in missing:
         url = f"{HF}/{entry['repo']}/resolve/main/{f}"
         expected = hf_checksum(entry["repo"], f)
@@ -453,6 +470,12 @@ def fetch(entry, into, assume_yes, what):
                 sys.exit(f"{p.name} arrived damaged twice ({why}). Check your internet connection and disk, then try again.")
             print(f"  {p.name} arrived damaged ({why}); downloading it again", flush=True)
     return paths[0]
+
+
+def default_packed(first):
+    """Where a model's packed experts live by default: next to it, named after it."""
+    first = Path(first)
+    return first.parent / (first.name.split("-00001-of-")[0].removesuffix(".gguf") + "-experts-packed")
 
 
 def hf_checksum(repo, path):
@@ -515,6 +538,8 @@ def cmd_list():
     print(f"models stowaway can download and run (speeds for this computer: {ram:.1f} GB free"
           + (f", drive ~{drive:.1f} GB/s" if drive else ", assuming a normal NVMe SSD") + "):\n")
     for name, e in CATALOG.items():
+        if e.get("hidden"):
+            continue
         here = (models_dir() / name / Path(e["files"][0]).name).exists()
         sp = speeds.get(name)
         speed = "doesn't fit here" if sp is None else ("too little memory" if sp < 0.2 else f"~{sp:.0f} words/s" if sp >= 1.5 else f"~{sp:.1f} words/s")
@@ -581,6 +606,8 @@ def recommend():
     free = shutil.disk_usage(models_dir()).free / GB
     speeds = {}
     for name, e in CATALOG.items():
+        if e.get("hidden"):
+            continue
         here = all((models_dir() / name / Path(f).name).exists() for f in e["files"])
         fits = here or free >= e["gb"] * 1.1
         speeds[name] = expected_speed(name, ram, drive or 3.0) if fits else None
@@ -592,7 +619,7 @@ def recommend():
 
 def menu():
     """What you get when you double-click stowaway: pick a model and chat, no typing commands."""
-    names = list(CATALOG)
+    names = [n for n, e in CATALOG.items() if not e.get("hidden")]
     print("stowaway - run big AI models on an ordinary computer\n")
     speeds, best, ram, drive = recommend()
     print(f"this computer: {ram:.1f} GB of memory free" + (f", drive ~{drive:.1f} GB/s" if drive else "") + "\n")
@@ -697,7 +724,7 @@ def run(args):
     if fewer:
         info["active_expert_gb"] *= args.experts / info["k"]
     first = info["parts"][0]
-    packed = Path(args.packed) if args.packed else first.parent / (first.name.split("-00001-of-")[0].removesuffix(".gguf") + "-experts-packed")
+    packed = Path(args.packed) if args.packed else default_packed(first)
     ram = args.ram if args.ram else available_ram_gb()
     draft = find_draft(first, args.draft)
     if info["mtp"] and args.draft is None:

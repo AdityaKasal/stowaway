@@ -66,9 +66,10 @@ words ahead so each pass over the weights produces several words.
 Speed comes down to drive speed divided by the bytes read per word. All the measurements, including the ideas that
 didn't work, are in [RESULTS.md](RESULTS.md).
 
-Setup packs the experts once into a file laid out for fast reads. For models stowaway downloads, the model file's
-own copy of the experts is freed as it goes (the file keeps its size but the space is released), so a model needs
-about its own size on disk instead of twice.
+Models from the menu download straight into a layout built for fast reads: the experts go into one file laid out
+expert by expert, and the rest of the model into the .gguf (whose expert ranges stay empty), so every byte is written
+once and a model needs about its own size on disk. A model file you bring yourself is packed once, freeing its own
+copy of the experts as it goes (`--slim`).
 
 `--fast` turns on cache-aware routing. When the expert the model wants isn't in memory but a nearly-as-good one is,
 it uses that one (39% less reading while answering, on the 8 GB setup). While reading your question, it prefers

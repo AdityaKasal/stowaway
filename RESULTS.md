@@ -661,6 +661,29 @@ Every number in the app's estimate table is now measured. The app's recommendati
 now has this point, and the README's "what to expect" says what a typical 8 GB Windows laptop gets, not only the
 roomier Linux numbers.
 
+## 25. Downloading straight into the packed layout (2026-09-26)
+
+Before, a catalog model was downloaded, then re-read and its experts written a second time in the packed layout, then
+the originals freed (section 17): a multi-minute "one-time setup" and every expert byte written to the SSD twice.
+`streampack.py` reads the GGUF header first (a few MB, over HTTP range requests), which gives every tensor's offset,
+then routes the download as it arrives: expert weights go straight into `<packed>.bin` in the packed layout
+(`repack_experts.plan_layout`, shared with the old path), everything else into the .gguf at its own offset. The
+.gguf's expert ranges are never written, so they stay holes, as in a slimmed file. The SHA-256 of the stream is checked
+against Hugging Face's. Checkpoints every 256 MB let an interrupted download resume; the hash is rebuilt from what's on
+disk.
+
+Tests: tiny MoE (`ggml-org/stories15M_MOE`), straight and with a simulated power cut after 20 MB: packed file and index
+byte-identical to `repack_experts.py`, and the .gguf equal to the original with its expert ranges zeroed. A
+wrong checksum is caught and everything cleaned up. gpt-oss-20b (12.1 GB), full download on Linux (385 s) and natively on
+Windows (403 s): packed file byte-identical to the one made earlier by `repack --slim` (same SHA-256 on both systems),
+index identical, and the .gguf identical outside the expert ranges (all zeros inside them; the old slim leaves up to
+4 KB of original bytes at range edges, which are never read). Disk use: 1.96 GB for the .gguf plus 10.15 GB packed.
+
+Found on the way: on Windows, Python's `truncate()` extends a file through the C runtime's `_chsize`, which writes
+zeros and so allocates everything, even for a sparse file (1 GB allocated after one 4 KB write). Files are now sized with
+`SetFilePointerEx` + `SetEndOfFile` after marking them sparse. That also affected the old packing path on Windows,
+which was writing zeros over the whole packed file before the real data (85-123 GB for the big models); fixed too.
+
 ## What didn't work, and why
 - Sharing experts inside the helper's guess-checking batches (`MOE_BATCH_VERIFY=1`, 2-16 token batches; 122B Q8, 8 GB,
   3 GB/s, 3 prompts): answering 0.6/0.9/0.5 tok/s vs 0.6/0.8/0.5 without it. The batches only touch 15-26 experts

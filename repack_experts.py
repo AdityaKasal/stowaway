@@ -47,6 +47,28 @@ def _read_all(f, n):
     return bytes(out)
 
 
+ORDER = {"ffn_gate_exps": 0, "ffn_up_exps": 1, "ffn_gate_up_exps": 1, "ffn_down_exps": 2}
+
+
+def plan_layout(layers, n_expert):
+    """The packed layout. layers: {layer: [(order, name, part index, file offset, bytes), ...]} for the expert weight
+    tensors. Returns (plan, index lines, total bytes); plan = [(layer, base, block, [(name, part, file offset, bytes,
+    offset in block, bytes per expert), ...]), ...]. Shared by repack() and the direct download (streampack.py), so
+    both produce byte-identical files."""
+    index_lines, base, plan = [], 0, []
+    for L in sorted(layers):
+        offs, block = [], 0
+        for _, name, pi, foff, nbytes in sorted(layers[L]):
+            per = nbytes // n_expert
+            offs.append((name, pi, foff, nbytes, block, per))
+            block += pad(per)
+        plan.append((L, base, block, offs))
+        for name, pi, foff, nbytes, off, per in offs:
+            index_lines.append(f"{name} {L} {base} {block} {off} {per}")
+        base += block * n_expert
+    return plan, index_lines, base
+
+
 def _readers(parts):
     return [gguf.GGUFReader(p) for p in parts]
 
@@ -67,7 +89,7 @@ def repack(first, out, slim=False):
     del meta
 
     # layer -> [(order, name, part index, file offset, bytes)] in a fixed order (gate, up, down)
-    order = {"ffn_gate_exps": 0, "ffn_up_exps": 1, "ffn_gate_up_exps": 1, "ffn_down_exps": 2}
+    order = ORDER
     layers = defaultdict(list)
     readers = _readers(parts)
     for pi, r in enumerate(readers):
@@ -78,18 +100,7 @@ def repack(first, out, slim=False):
     del readers, r, t
     gc.collect()
 
-    index_lines, base, plan = [], 0, []
-    for L in sorted(layers):
-        offs, block = [], 0
-        for _, name, pi, foff, nbytes in sorted(layers[L]):
-            per = nbytes // n_expert
-            offs.append((name, pi, foff, nbytes, block, per))
-            block += pad(per)
-        plan.append((L, base, block, offs))
-        for name, pi, foff, nbytes, off, per in offs:
-            index_lines.append(f"{name} {L} {base} {block} {off} {per}")
-        base += block * n_expert
-    total = base
+    plan, index_lines, total = plan_layout(layers, n_expert)
 
     progress = Path(f"{out}.progress")
     done_layers = set(int(x) for x in progress.read_text().split()) if progress.exists() else set()
@@ -100,8 +111,10 @@ def repack(first, out, slim=False):
     print(f"{len(plan)} layers, {n_expert} experts, block {plan[0][2] / 1e6:.2f} MB, writing {total / 1e9:.1f} GB to "
           f"{out}.bin" + (" (freeing the originals' copy as it goes)" if slim else ""), flush=True)
     t0, done, freed = time.time(), 0, 0
-    with open(f"{out}.bin", "r+b" if Path(f"{out}.bin").exists() else "w+b", buffering=0) as f:
-        f.truncate(total)
+    if not Path(f"{out}.bin").exists():
+        import sparse  # sized without writing: on Windows, truncate() would zero-fill the whole file first
+        sparse.make_sparse_file(f"{out}.bin", total)
+    with open(f"{out}.bin", "r+b", buffering=0) as f:
         for L, lbase, block, offs in plan:
             if L in done_layers:
                 continue

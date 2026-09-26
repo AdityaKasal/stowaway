@@ -113,6 +113,10 @@ jobs:
           $D/stowaway --version
           MOE_HOME=$PWD/home $D/stowaway run tiny.gguf --slim -p "Once upon a time" -n 16 < /dev/null > out.txt 2>&1 || { cat out.txt; exit 1; }
           grep -E "Generation" out.txt
+          # download straight into the packed layout (checksum-verified), then run it
+          MOE_HOME=$PWD/home2 $D/stowaway run test-tiny --yes -p "Once upon a time" -n 16 < /dev/null > out3.txt 2>&1 || { cat out3.txt; exit 1; }
+          grep -E "downloading straight" out3.txt && grep -E "Generation" out3.txt
+          if grep -q "one-time setup" out3.txt; then echo "unexpected packing step after a direct download"; exit 1; fi
           if [ -d $D/compat ]; then
             STOWAWAY_COMPAT=1 MOE_HOME=$PWD/home $D/stowaway run tiny.gguf -p "Once upon a time" -n 16 < /dev/null > out2.txt 2>&1 || { cat out2.txt; exit 1; }
             grep -E "^cpu|Generation" out2.txt
