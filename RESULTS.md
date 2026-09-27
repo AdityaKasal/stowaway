@@ -725,6 +725,27 @@ Planner change: with the always-needed weights in RAM, the cache gets everything
 
 No OOM kills; lowest free memory stayed above 2.8 GB in the VMs.
 
+## 28. Fewer bits for the Qwen 122B: quality vs speed (2026-09-26)
+
+Reference: Qwen3.5-122B Q8_0. WikiText-2 4 x 512 in batch mode, KL divergence against Q8 (`pc/iq4-pipeline.ps1`):
+
+| Version | Size | Same top token as Q8 | Mean KLD | 99th percentile KLD |
+|---|---|---|---|---|
+| Q5_K_M | 91.5 GB | 96.7% | 0.0077 | 0.11 |
+| UD-IQ4_XS (Unsloth dynamic 4-bit) | 60.2 GB | 95.1% | 0.043 | 0.58 |
+
+(Q8's perplexity: 3.336.) Q5 is nearly indistinguishable from Q8; IQ4_XS drifts ~5x more, mostly on a small share of
+tokens. Speed through the app at 3 GB/s (`vm/iq4-speed.sh`, downloaded straight into the packed layout):
+
+| Machine | Q8 | Q5 | UD-IQ4_XS | gpt-oss-120b (exact) |
+|---|---|---|---|---|
+| 8 GB | 0.6 | ~0.7 | 1.0 | 2.7 |
+| 16 GB | 1.3 | ~1.7 | 3.4 | 4.1 |
+
+On 8 GB the always-needed weights are streamed and the drive dominates, so fewer bits help little; on 16 GB they stay
+in RAM and a 4-bit model's experts fit the cache far better. The catalog gets `qwen3.5-122b-4bit` as an option, ranked
+below gpt-oss-120b in the recommendation because it isn't exact.
+
 ## What didn't work, and why
 - Sharing experts inside the helper's guess-checking batches (`MOE_BATCH_VERIFY=1`, 2-16 token batches; 122B Q8, 8 GB,
   3 GB/s, 3 prompts): answering 0.6/0.9/0.5 tok/s vs 0.6/0.8/0.5 without it. The batches only touch 15-26 experts

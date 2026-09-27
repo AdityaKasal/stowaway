@@ -32,7 +32,7 @@ if not FROZEN:
     sys.path.insert(0, str(HERE / "llama.cpp" / "gguf-py"))
 import gguf  # noqa: E402
 
-VERSION = "0.2.17"
+VERSION = "0.2.18"
 REPO = "AdityaKasal/stowaway"
 
 import pack_dense  # noqa: E402
@@ -330,6 +330,11 @@ CATALOG = {
         "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
         "files": [f"Q5_K_M/Qwen3.5-122B-A10B-Q5_K_M-0000{i}-of-00003.gguf" for i in (1, 2, 3)], "gb": 91.5,
     },
+    "qwen3.5-122b-4bit": {
+        "about": "Qwen3.5 122B-A10B, 4-bit (UD-IQ4_XS). About 2x faster than Q5 with 16 GB; slightly less exact.",
+        "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
+        "files": [f"UD-IQ4_XS/Qwen3.5-122B-A10B-UD-IQ4_XS-0000{i}-of-00003.gguf" for i in (1, 2, 3)], "gb": 60.2,
+    },
 }
 HELPER = {"repo": "unsloth/Qwen3.5-0.8B-GGUF", "files": ["Qwen3.5-0.8B-Q4_K_M.gguf"], "gb": 0.53}
 
@@ -554,7 +559,7 @@ def cmd_list():
         here = (models_dir() / name / Path(e["files"][0]).name).exists()
         sp = speeds.get(name)
         speed = "doesn't fit here" if sp is None else ("too little memory" if sp < 0.2 else f"~{sp:.0f} words/s" if sp >= 1.5 else f"~{sp:.1f} words/s")
-        print(f"  {name:13s} {e['gb']:5.1f} GB  {speed:17s} {'(downloaded) ' if here else ''}{e['about']}"
+        print(f"  {name:17s} {e['gb']:5.1f} GB  {speed:17s} {'(downloaded) ' if here else ''}{e['about']}"
               + ("  <- recommended" if name == best else ""))
     print(f"\nmodels are stored in {models_dir()} (to change it: double-click stowaway and press f, or set MOE_HOME)")
     print("any other Mixture-of-Experts GGUF file works too: stowaway run path/to/model.gguf")
@@ -571,8 +576,10 @@ MEASURED = {
     "gpt-oss-20b":  {"ram": [(1.9, 0.0), (3.2, 2.4), (5.2, 4.7), (7.3, 8.0), (15.5, 14.1)], "sata": 0.24},
     "gpt-oss-120b": {"ram": [(2.3, 0.0), (3.2, 0.7), (5.2, 1.8), (7.3, 2.7), (15.5, 4.1)], "sata": 0.22},
     "qwen3.5-122b": {"ram": [(3.3, 0.0), (5.2, 0.5), (7.3, 0.7), (15.5, 1.7)], "sata": 0.20},
+    "qwen3.5-122b-4bit": {"ram": [(3.3, 0.0), (7.3, 1.0), (15.5, 3.4)], "sata": 0.20},  # RESULTS.md 28
 }
-QUALITY = ["qwen3.5-122b", "gpt-oss-120b", "qwen3.6-35b", "qwen3.5-35b", "gpt-oss-20b"]  # best first
+# best first; a lossy quant ranks below an exact model of similar size, so it's recommended only when that one isn't comfortable
+QUALITY = ["qwen3.5-122b", "gpt-oss-120b", "qwen3.5-122b-4bit", "qwen3.6-35b", "qwen3.5-35b", "gpt-oss-20b"]
 COMFORT = 3.0  # words/s: about reading speed
 
 
@@ -661,7 +668,7 @@ def delete_model():
         return
     print()
     for i, (name, size, d) in enumerate(have, 1):
-        print(f"  {i}. {name:13s} {size:6.1f} GB  ({d})")
+        print(f"  {i}. {name:17s} {size:6.1f} GB  ({d})")
     try:
         pick = input("\ndelete which one? (number, Enter = cancel) ").strip()
         if not pick:
@@ -710,7 +717,7 @@ def menu():
         sp = speeds.get(name)
         speed = "doesn't fit here" if sp is None else ("too little memory" if sp < 0.2 else f"~{sp:.0f} words/s here" if sp >= 1.5 else f"~{sp:.1f} words/s here")
         mark = "  <- recommended" if name == best else ""
-        print(f"  {i}. {name:13s} {e['gb']:5.1f} GB  {speed:18s} {'(downloaded) ' if here else ''}{e['about']}{mark}")
+        print(f"  {i}. {name:17s} {e['gb']:5.1f} GB  {speed:18s} {'(downloaded) ' if here else ''}{e['about']}{mark}")
     print(f"\nmodels are stored in {models_dir()}" + ("" if drive else " (speeds assume a normal NVMe SSD until one is downloaded)"))
     default = names.index(best) + 1 if best else 1
     try:

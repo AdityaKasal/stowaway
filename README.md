@@ -27,6 +27,7 @@ in your browser.
 | OpenAI gpt-oss-20b (12 GB) | ~8 / ~4.7 | ~2.4 | ~14 |
 | OpenAI gpt-oss-120b (63 GB) | ~2.7 / ~1.8 | ~0.7 | ~4 |
 | Qwen3.5-122B-A10B Q5 (92 GB) | ~0.7 / ~0.5 | | ~1.5-2 with `--fast` |
+| Qwen3.5-122B-A10B 4-bit, UD-IQ4_XS (60 GB; slightly less exact) | ~1.0 | | ~3.4 |
 
 On a SATA SSD expect roughly a quarter to a third of the NVMe speed. The app estimates the speed of each model on your
 computer and recommends one.
