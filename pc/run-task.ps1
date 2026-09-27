@@ -10,6 +10,10 @@ $action = New-ScheduledTaskAction -Execute "powershell.exe" `
   -WorkingDirectory $root
 $principal = New-ScheduledTaskPrincipal -UserId "FSOCIETY\fsociety" -LogonType S4U -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 6) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+# re-registering does not stop a running instance (it would keep the log open), so stop it first
+Stop-ScheduledTask -TaskName "moe-$Name" -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -like "*$log*" } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Unregister-ScheduledTask -TaskName "moe-$Name" -Confirm:$false -ErrorAction SilentlyContinue
 Register-ScheduledTask -TaskName "moe-$Name" -Action $action -Principal $principal -Settings $settings | Out-Null
 Start-ScheduledTask -TaskName "moe-$Name"

@@ -746,7 +746,81 @@ On 8 GB the always-needed weights are streamed and the drive dominates, so fewer
 in RAM and a 4-bit model's experts fit the cache far better. The catalog gets `qwen3.5-122b-4bit` as an option, ranked
 below gpt-oss-120b in the recommendation because it isn't exact.
 
+## 29. Qwen3.8-Flash-Next: a stronger 125B that is lighter per word (2026-09-26)
+
+Qwen3.8-Flash-Next (August 2026, arch `qwen4exp`, already supported by our llama.cpp `d2e5458`): 125B parameters with
+6B used per word (10 of 512 small experts plus a shared one, 48 layers of Gated DeltaNet and sparse attention), plus a
+51B n-gram embedding table. The model card puts it ahead of DeepSeek-V4-Flash (284B) and Qwen3.7-Plus (397B) on most
+listed benchmarks. The n-gram table is looked up a few rows per word, and llama.cpp already reads it lazily from disk
+(`TENSOR_READ_LAZY`, random-access hints), so stowaway counts it as a lookup table like the word embeddings, not as
+always-needed weights (`moe-stream.h` setup_dense, `moe.py` LOOKUP_TABLES, `pack_dense.py`). Without that it would have
+tried to keep or stream 29 GB per word.
+
+Unsloth UD-IQ4_XS, 93.7 GB: 59.5 GB of experts (1.16 GB per word before caching), a 28.8 GB n-gram table, and 4.7 GB of
+always-needed weights (attention, DeltaNet, shared experts, hyper-connections; mostly Q8_0). Downloaded straight into
+the packed layout in 50 min at ~31 MB/s; answers are coherent.
+
+Speed through the app (`vm/q38-speed.sh`: memory-capped VM, 4 threads, drive capped at 3 GB/s):
+
+| Free RAM | Plan | words/s |
+|---|---|---|
+| 5.3 GB (6 GB VM) | always-needed weights streamed (1.3 GB/word), 0.2 GB expert cache | 0.4 |
+| 7.4 GB (8 GB VM) | always-needed weights in RAM, 0.8 GB cache | 2.6 |
+| 8.5 GB (9 GB VM) | in RAM, 1.8 GB cache | 3.2-3.3 |
+| 15.5 GB (16 GB VM) | in RAM, 8.9 GB cache (reads 0.2-0.3 GB/word) | 3.9-4.0 |
+
+At 8 GB that matches gpt-oss-120b (2.7) and is 2.6x the Qwen3.5-122B 4-bit (1.0) from a much stronger model; at
+16 GB the drive hardly matters and the 4.7 GB of always-needed weights read from RAM every word are the limit.
+
+`--fast`'s cache-aware routing does not suit this model (`vm/q38-kld.sh`, one token at a time, 8.5 GB cache,
+WikiText 2 x 512, KLD vs normal routing; reference PPL 3.09):
+
+| Bonus | Picks switched | Mean KLD | Same top token |
+|---|---|---|---|
+| 1.0 (what `--fast` uses) | 22.3% | 0.254 | 86.1% |
+| 0.25 | 8.9% | 0.128 | 89.4% |
+
+That is ~9x the Qwen3.5-35B's cost (KLD 0.029): with 512 small experts, a substitute is rarely close. `--fast` is off for
+`qwen4exp`, as for gpt-oss.
+
+What limits it. At 16 GB the model waits on the drive for only 0.05-0.07 s a word; the rest (~0.19 s) is computing
+on 4 threads, so ~4 words/s is about the ceiling for a 4-core laptop. At 8 GB the 0.8 GB cache holds fewer experts
+than one word uses (480), so it saves little, and waiting adds 0.13-0.2 s a word. Two ideas to do better, both measured and
+both dropped:
+
+**Storing the always-needed weights in fewer bits.** They are 4.7 GB, mostly 8-bit, and read every word; 1 GB less
+would give the 8 GB machine what the 9 GB one has (2.6 -> 3.2 words/s). `slim_dense.py` rewrites a file's 8-bit
+always-needed tensors as Q5_1 (in place in one forward pass with a crash-safe journal, or as a copy);
+`splice_dense.py` instead takes them from Unsloth's UD-Q2_K_XL, where they are Q5_K/Q6_K made with an importance
+matrix. Tested on file 3 of 3 (layers 14-47, ~70% of those weights), WikiText 4 x 512 in batch mode, KLD vs the
+unchanged model (`vm/q38-slimdense.sh`, `vm/q38-slim2.sh`):
+
+| Version | Smaller by | Mean KLD | 99th pct | Same top token |
+|---|---|---|---|---|
+| Q5_1 (6 bits), all | 0.77 GB | 0.098 | 1.36 | 91.9% |
+| Q4_1 (5 bits), all | 1.08 GB | 0.226 | 3.09 | 87.3% |
+| Q5_1, hyper-connection/shared-expert/ple_key weights kept at 8 bits | 0.58 GB | 0.066 | 0.90 | 93.4% |
+| Unsloth's UD-Q2_K_XL versions (Q5_K/Q6_K, importance matrix) | 0.68 GB | 0.061 | 0.83 | 92.5% |
+
+Even Unsloth's calibrated versions cost more than the whole 4-bit conversion of the 122B (KLD 0.043, section 28):
+this model's always-needed weights are unusually sensitive. Speed barely moved where they already fit (16 GB:
+3.9-4.0 -> 4.1-4.2 with Q5_1 on file 3), and at 6 GB they still did not fit (0.4). They stay at 8 bits; the two tools
+stay in the repo for other models.
+
+**Per-layer shares for a cache smaller than one word's experts.** With one shared LRU the layers run in a cycle, so
+each expert is evicted just before the next word could reuse it. Giving each layer its own share of slots
+(`MOE_CACHE_PER_LAYER`, tried and removed) cut reads 15% on one prompt at 8 GB but not the other, and did not change
+the speed (2.4-2.5 either way); at 9 GB it was slower (3.1 -> 2.7-2.8). With the compute share this large, fewer reads
+barely show.
+
+The app: `qwen3.8-next` heads the catalog and the quality ranking (recommended from ~9 GB free up); the two
+Qwen3.5-122B entries are shown only if already downloaded, since Qwen3.8 is both stronger and faster everywhere.
+
 ## What didn't work, and why
+- Storing Qwen3.8's always-needed weights in fewer bits (Q5_1, Q4_1, or Unsloth's calibrated Q5_K/Q6_K): KLD 0.06-0.23
+  for at most ~1 GB saved; they stay at 8 bits (section 29).
+- Per-layer cache shares for a cache smaller than one word's experts: fewer reads on one prompt, no speed gain at 8 GB,
+  slower at 9 GB (section 29).
 - Sharing experts inside the helper's guess-checking batches (`MOE_BATCH_VERIFY=1`, 2-16 token batches; 122B Q8, 8 GB,
   3 GB/s, 3 prompts): answering 0.6/0.9/0.5 tok/s vs 0.6/0.8/0.5 without it. The batches only touch 15-26 experts
   per layer, so there's little to share, and each pass is dominated by the streamed always-needed weights. It stays an

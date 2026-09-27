@@ -77,7 +77,7 @@ def test_recommendation_by_machine():
         return good[0] if good else max(sp, key=sp.get)
     assert pick(3.2, 3.0) == "gpt-oss-20b"
     assert pick(7.3, 3.0) == "qwen3.6-35b"
-    assert pick(15.5, 3.0) == "gpt-oss-120b"
+    assert pick(15.5, 3.0) == "qwen3.8-next"
 
 
 def test_small_machine_plan_streams_and_keeps_a_margin():
@@ -106,3 +106,54 @@ def test_parse_header_roundtrip():
     assert kv["general.architecture"] == "llama" and kv["general.alignment"] == 64
     assert tensors == [("blk.0.ffn_up_exps.weight", 64 * 32 * 4 * 4, 0)]
     assert data_start % 64 == 0 and data_start >= len(body)
+
+
+def test_slim_dense_in_place_matches_a_copy_and_resumes(tmp_path, monkeypatch):
+    """Shrinking the 8-bit always-needed weights: nothing before a big table is touched (so the table never moves), the
+    rest become Q5_1 and stay close to the originals, and an in-place run interrupted halfway ends byte-identical to a
+    fresh copy."""
+    import shutil
+    import numpy as np
+    import gguf
+    import pytest
+    import slim_dense
+    from gguf.constants import GGMLQuantizationType as Q
+    monkeypatch.setattr(slim_dense, "BIG", 4096)
+    rng = np.random.default_rng(0)
+    w8 = {n: rng.standard_normal(shape).astype(np.float32) for n, shape in
+          [("blk.0.attn_q.weight", (8, 64)), ("blk.1.attn_q.weight", (16, 64)), ("blk.1.attn_output.weight", (4, 96))]}
+    table, exps = rng.standard_normal((64, 32)).astype(np.float32), rng.standard_normal((2, 4, 32)).astype(np.float32)
+    src = tmp_path / "m.gguf"
+    wr = gguf.GGUFWriter(str(src), "llama")
+    wr.add_tensor("blk.0.attn_q.weight", gguf.quants.quantize(w8["blk.0.attn_q.weight"], Q.Q8_0), raw_dtype=Q.Q8_0)
+    wr.add_tensor("per_layer_token_embd.weight", table)
+    for n in ("blk.1.attn_q.weight", "blk.1.attn_output.weight"):
+        wr.add_tensor(n, gguf.quants.quantize(w8[n], Q.Q8_0), raw_dtype=Q.Q8_0)
+    wr.add_tensor("blk.1.ffn_up_exps.weight", exps)
+    wr.write_header_to_file()
+    wr.write_kv_data_to_file()
+    wr.write_tensors_to_file()
+    wr.close()
+
+    ref = tmp_path / "ref.gguf"
+    slim_dense.slim_copy(src, ref, Q.Q5_1, min_bytes=0, keep_experts=True)
+    inplace = tmp_path / "inplace.gguf"
+    shutil.copy(src, inplace)
+    with pytest.raises(slim_dense.SimulatedCrash):
+        slim_dense.slim_in_place(inplace, Q.Q5_1, min_bytes=0, keep_experts=True, crash_after=1)
+    assert slim_dense.slim_in_place(inplace, Q.Q5_1, min_bytes=0, keep_experts=True) > 0
+    assert inplace.read_bytes() == ref.read_bytes()
+    assert slim_dense.slim_in_place(inplace, Q.Q5_1, min_bytes=0, keep_experts=True) == 0  # already done
+    assert not list(tmp_path.glob("inplace.gguf.slim*"))
+
+    before = {t.name: t for t in gguf.GGUFReader(src).tensors}
+    after = {t.name: t for t in gguf.GGUFReader(ref).tensors}
+    assert after["blk.0.attn_q.weight"].tensor_type == Q.Q8_0  # before the big table: left alone
+    assert after["per_layer_token_embd.weight"].data_offset == before["per_layer_token_embd.weight"].data_offset
+    assert np.array_equal(after["per_layer_token_embd.weight"].data, table)
+    assert np.array_equal(after["blk.1.ffn_up_exps.weight"].data, exps)
+    for n in ("blk.1.attn_q.weight", "blk.1.attn_output.weight"):
+        assert after[n].tensor_type == Q.Q5_1
+        got = gguf.quants.dequantize(after[n].data, Q.Q5_1)
+        err = np.abs(got - w8[n]).mean() / np.abs(w8[n]).mean()
+        assert err < 0.05, (n, err)

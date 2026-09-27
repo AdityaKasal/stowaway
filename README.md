@@ -2,9 +2,10 @@
 
 Run big AI models on an ordinary computer: no graphics card, 8 GB of RAM.
 
-stowaway runs **Qwen3.5-122B-A10B at Q5** (a 91.5 GB model) on a machine with 8 GB of RAM and no GPU, and
-**Qwen3.5-35B-A3B at Q5** (26 GB) at conversation speed on the same machine. Normally both need a big GPU or a lot
-of RAM. The quality is unchanged: it's the full Q5 model, not a smaller or more compressed one.
+stowaway runs **Qwen3.8-Flash-Next** (125B parameters, a 94 GB download; its makers' tests put it ahead of models
+2-3x its size) on a machine with 8 GB of RAM and no GPU, at ~2.6 words per second (~4 with 16 GB), and
+**Qwen3.6-35B-A3B at Q5** (26 GB) at conversation speed on the same machine. Normally both need a big GPU or a lot
+of RAM. The quality is unchanged: it's the published model file, not a smaller or more compressed one.
 
 ![moe chatting with Qwen3.5-35B-A3B Q5 in the browser](docs/chat.gif)
 
@@ -23,13 +24,14 @@ in your browser.
 
 | Model (download) | 8 GB machine, NVMe SSD: most memory free / ~5 GB free (a typical Windows laptop) | 4 GB machine | 16 GB |
 |---|---|---|---|
-| Qwen3.6-35B-A3B Q5 (26.5 GB; same speed as 3.5) | ~8.5 / ~5-7 words per second (~7-9 with `--fast`) | ~2 | ~8.5 |
+| Qwen3.8-Flash-Next 4-bit (94 GB) | ~2.6 / ~0.4 words per second | | ~4 |
+| Qwen3.6-35B-A3B Q5 (26.5 GB; same speed as 3.5) | ~8.5 / ~5-7 (~7-9 with `--fast`) | ~2 | ~8.5 |
 | OpenAI gpt-oss-20b (12 GB) | ~8 / ~4.7 | ~2.4 | ~14 |
 | OpenAI gpt-oss-120b (63 GB) | ~2.7 / ~1.8 | ~0.7 | ~4 |
-| Qwen3.5-122B-A10B Q5 (92 GB) | ~0.7 / ~0.5 | | ~1.5-2 with `--fast` |
-| Qwen3.5-122B-A10B 4-bit, UD-IQ4_XS (60 GB; slightly less exact) | ~1.0 | | ~3.4 |
 
-On a SATA SSD expect roughly a quarter to a third of the NVMe speed. The app estimates the speed of each model on your
+Qwen3.5-122B-A10B (Q5, 92 GB, or 4-bit, 60 GB) still runs if you already have it (0.7-1.0 words per second with 8 GB,
+1.7-3.4 with 16 GB); Qwen3.8 is stronger and faster, so the menu no longer offers it. On a SATA SSD expect roughly a
+quarter to a third of the NVMe speed. The app estimates the speed of each model on your
 computer and recommends one.
 
 You need an SSD and about the model's size in free disk space, plus 10%. Short on space? Press `f` in the menu to keep
@@ -41,7 +43,7 @@ stowaway run qwen3.5-35b           download (asks first), set up, chat in the br
 stowaway run qwen3.5-35b --cli     chat in the terminal
 stowaway run qwen3.5-35b --fast    faster answers and a faster first word; answers differ slightly (see below)
 stowaway run qwen3.5-35b --think   let the model think before answering (off by default: slow on slow machines)
-stowaway plan qwen3.5-122b         show the memory plan and expected speed
+stowaway plan qwen3.8-next         show the memory plan and expected speed
 stowaway run path/to/model.gguf    any other Mixture-of-Experts GGUF model (add --slim to halve its disk use)
 ```
 
@@ -75,8 +77,9 @@ copy of the experts as it goes (`--slim`).
 `--fast` turns on cache-aware routing. When the expert the model wants isn't in memory but a nearly-as-good one is,
 it uses that one (39% less reading while answering, on the 8 GB setup). While reading your question, it prefers
 experts that other words of the question already need, which makes the first word come ~75% sooner for the 122B on
-8 GB. The quality cost is measured and small (RESULTS.md sections 16 and 20), but it's off by default because the
-answers change slightly.
+8 GB. The quality cost is measured and small for the Qwen3.5/3.6 models (RESULTS.md sections 16 and 20), but it's off
+by default because the answers change slightly. For gpt-oss and Qwen3.8, whose experts are much less interchangeable,
+`--fast` is ignored (sections 22 and 29).
 
 The cache never changes the output: it's bit-identical to plain llama.cpp. Guessing ahead is the same model at the
 same quality, but llama.cpp's batched check rounds slightly differently, so an occasional word can differ.
@@ -124,6 +127,7 @@ all four, runs each end to end on a tiny MoE model, and attaches them to the rel
 | `policies.py` | Replays a router trace through LRU, SLRU, 2Q, ARC, LFU-decay and the optimal policy |
 | `repack_experts.py` | Writes a copy of the experts with each expert's pieces side by side (packed mode) |
 | `pack_dense.py` | Writes the always-needed weights layer by layer, for one-read-per-layer streaming |
+| `slim_dense.py`, `splice_dense.py` | Research tools: store a model's 8-bit always-needed weights in fewer bits (in place, crash-safe), or take them from another quant of the same model. Not used by the app: for Qwen3.8 the quality cost was too high (RESULTS.md 29) |
 | `stripe_experts.py` | Copies part of the packed experts to a second drive (whole experts, or every expert's tail) |
 | `bench.sh` | Mac benchmark modes (`cpu`, `cpu-prefetch`, `stream`, `prefetch`, `naive`) |
 | `pc/*.ps1` | The same for the Windows PC (copies live in `C:\Users\FSociety\moe-router-study\scripts`) |

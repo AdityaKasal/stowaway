@@ -199,6 +199,7 @@ def fetch_packed(repo, files, into, packed, expected, ua):
                             h.update(chunk)
                             left -= len(chunk)
                 done, t0, last, since_ck = state["done"], time.time(), 0.0, 0
+                start = done  # the speed shown is measured from here (not from the last checkpoint)
                 attempt = 0
                 while done < size:
                     try:
@@ -223,7 +224,7 @@ def fetch_packed(repo, files, into, packed, expected, ua):
                                     since_ck = 0
                                 if time.time() - last > 2:
                                     last = time.time()
-                                    rate = (done - state["done"]) / max(time.time() - t0, 1e-3) / 1e6
+                                    rate = (done - start) / max(time.time() - t0, 1e-3) / 1e6
                                     print(f"\r  {final.name}: {done / 1e9:.1f} / {size / 1e9:.1f} GB  ({rate:.0f} MB/s)   ",
                                           end="", flush=True)
                     except Exception as e:  # network hiccup: continue from the last checkpoint
@@ -234,6 +235,7 @@ def fetch_packed(repo, files, into, packed, expected, ua):
                         fb.flush()
                         fg.flush()
                         done = state["done"]
+                        start, t0 = done, time.time()
                         h = hashlib.sha256()
                         for is_exp, dst, a, b in router.pieces(0, done):
                             src = fb if is_exp else fg

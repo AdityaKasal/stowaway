@@ -32,7 +32,7 @@ if not FROZEN:
     sys.path.insert(0, str(HERE / "llama.cpp" / "gguf-py"))
 import gguf  # noqa: E402
 
-VERSION = "0.2.18"
+VERSION = "0.2.19"
 REPO = "AdityaKasal/stowaway"
 
 import pack_dense  # noqa: E402
@@ -124,6 +124,12 @@ def split_parts(first):
     return [first]
 
 
+# Tables the model looks rows up in (the word embeddings, and Qwen3.8's 29 GB n-gram table): they stay on disk and
+# only the rows a word needs are read, so they cost neither RAM nor a full read per word.
+LOOKUP_TABLES = ("token_embd", "per_layer_token_embd")
+SWAP_SENSITIVE = {"gpt-oss": "gpt-oss", "qwen4exp": "Qwen3.8"}  # architectures --fast is turned off for
+
+
 def model_info(first):
     parts = split_parts(first)
     meta = gguf.GGUFReader(parts[0])
@@ -141,7 +147,7 @@ def model_info(first):
                 exp += n
             elif "_exps." in t.name:  # per-expert biases (gpt-oss): small, left to the OS like the embeddings
                 dense += n
-            elif t.name.startswith("token_embd"):
+            elif t.name.startswith(LOOKUP_TABLES):  # read a few rows per word, straight from disk
                 embd += n
             else:
                 dense += n
@@ -305,6 +311,12 @@ def ensure_packed(info, packed, slim):
 
 HF = "https://huggingface.co"
 CATALOG = {
+    "qwen3.8-next": {
+        "about": "Qwen3.8-Flash-Next (125B, 4-bit). The strongest here: beats models 2-3x its size in its makers' "
+                 "tests. Comfortable with 16 GB of RAM; ~2.5 words/s with 8 GB.",
+        "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+        "files": [f"UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-0000{i}-of-00003.gguf" for i in (1, 2, 3)], "gb": 93.7,
+    },
     "qwen3.6-35b": {
         "about": "Qwen3.6 35B-A3B (Q5). A strong all-rounder; newer than 3.5.",
         "repo": "unsloth/Qwen3.6-35B-A3B-GGUF", "files": ["Qwen3.6-35B-A3B-UD-Q5_K_M.gguf"], "gb": 26.5,
@@ -325,13 +337,15 @@ CATALOG = {
         "about": "tiny test model", "repo": "ggml-org/stories15M_MOE", "files": ["stories15M_MOE-Q8_0.gguf"],
         "gb": 0.04, "hidden": True,
     },
-    "qwen3.5-122b": {
-        "about": "Qwen3.5 122B-A10B (Q5). The biggest; comfortable with 16 GB+.",
+    "qwen3.5-122b": {  # Qwen3.8-Flash-Next is stronger and ~2x faster: shown only if already downloaded
+        "about": "Qwen3.5 122B-A10B (Q5). Superseded by qwen3.8-next; shown only if you already have it.",
+        "hidden_unless_downloaded": True,
         "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
         "files": [f"Q5_K_M/Qwen3.5-122B-A10B-Q5_K_M-0000{i}-of-00003.gguf" for i in (1, 2, 3)], "gb": 91.5,
     },
     "qwen3.5-122b-4bit": {
-        "about": "Qwen3.5 122B-A10B, 4-bit (UD-IQ4_XS). About 2x faster than Q5 with 16 GB; slightly less exact.",
+        "about": "Qwen3.5 122B-A10B, 4-bit (UD-IQ4_XS). Superseded by qwen3.8-next; shown only if you already have it.",
+        "hidden_unless_downloaded": True,
         "repo": "unsloth/Qwen3.5-122B-A10B-GGUF",
         "files": [f"UD-IQ4_XS/Qwen3.5-122B-A10B-UD-IQ4_XS-0000{i}-of-00003.gguf" for i in (1, 2, 3)], "gb": 60.2,
     },
@@ -577,9 +591,13 @@ MEASURED = {
     "gpt-oss-120b": {"ram": [(2.3, 0.0), (3.2, 0.7), (5.2, 1.8), (7.3, 2.7), (15.5, 4.1)], "sata": 0.22},
     "qwen3.5-122b": {"ram": [(3.3, 0.0), (5.2, 0.5), (7.3, 0.7), (15.5, 1.7)], "sata": 0.20},
     "qwen3.5-122b-4bit": {"ram": [(3.3, 0.0), (7.3, 1.0), (15.5, 3.4)], "sata": 0.20},  # RESULTS.md 28
+    # mostly computing, so a faster drive barely helps: 16 GB, 3.9-4.0 at 3 GB/s vs 3.8-3.9 at 4.9 GB/s (RESULTS.md 29)
+    "qwen3.8-next": {"ram": [(4.0, 0.0), (5.3, 0.4), (7.4, 2.6), (8.5, 3.25), (15.5, 3.95)], "sata": 0.20,
+                     "fast_drive": 1.0},
 }
-# best first; a lossy quant ranks below an exact model of similar size, so it's recommended only when that one isn't comfortable
-QUALITY = ["qwen3.5-122b", "gpt-oss-120b", "qwen3.5-122b-4bit", "qwen3.6-35b", "qwen3.5-35b", "gpt-oss-20b"]
+# best first. Qwen3.8 is 4-bit but far ahead of the rest in its makers' tests; otherwise a lossy quant ranks below an exact
+# model of similar size, so it's recommended only when that one isn't comfortable
+QUALITY = ["qwen3.8-next", "qwen3.5-122b", "gpt-oss-120b", "qwen3.5-122b-4bit", "qwen3.6-35b", "qwen3.5-35b", "gpt-oss-20b"]
 COMFORT = 3.0  # words/s: about reading speed
 
 
@@ -612,7 +630,7 @@ def expected_speed(name, ram_gb, drive_gbps):
         elif drive_gbps <= 3.0:
             f = r + (1 - r) * (drive_gbps - 0.55) / (3.0 - 0.55)
         else:
-            f = min(1.5, 1 + 0.5 * (drive_gbps - 3.0) / 3.0)
+            f = min(m.get("fast_drive", 1.5), 1 + 0.5 * (drive_gbps - 3.0) / 3.0)
         s *= f
     return s
 
@@ -830,7 +848,8 @@ def run(args):
     drive = drive_speed_gbps(Path(f"{packed}.bin") if Path(f"{packed}.bin").exists() else info["parts"][-1])
 
     print(f"model:   {first.name}  ({info['file_gb']:.1f} GB: {info['expert_gb']:.1f} GB experts, "
-          f"{info['dense_gb']:.1f} GB always-needed; {info['active_expert_gb']:.2f} GB of experts per token)")
+          f"{info['dense_gb']:.1f} GB always-needed; {info['active_expert_gb']:.2f} GB of experts per token"
+          + (f"; {info['embd_gb']:.1f} GB lookup tables stay on disk" if info["embd_gb"] > 2 else "") + ")")
     print(f"machine: {ram:.1f} GB RAM free, {args.threads} threads, drive ~{drive:.1f} GB/s" if drive else
           f"machine: {ram:.1f} GB RAM free, {args.threads} threads")
     plan, err = make_plan(info, ram, drive)
@@ -868,9 +887,10 @@ def run(args):
     # pays when the cache holds at least one token's worth of experts: measured -39% reads on the 35B at 8 GB (cache =
     # 3.6 tokens' worth), nothing on the 122B Q8 at 8 GB (0.13), where it would only change the output.
     fast_answer = args.fast and plan["cache_gb"] >= info["active_expert_gb"]
-    if args.fast and info["arch"] == "gpt-oss":
-        # measured: gpt-oss is far more sensitive to expert swaps (73-82% same top token vs 93% for Qwen; RESULTS.md 22)
-        print("fast:    not used for gpt-oss models: swapping their experts changes the answers too much")
+    if args.fast and info["arch"] in SWAP_SENSITIVE:
+        # measured: gpt-oss (73-82% same top token vs 93% for Qwen3.5; RESULTS.md 22) and Qwen3.8's 512 small experts
+        # (KLD 0.25 / 86% at full bonus, 0.13 / 89% at a quarter; RESULTS.md 29) are far more sensitive to expert swaps
+        print(f"fast:    not used for {SWAP_SENSITIVE[info['arch']]} models: swapping their experts changes the answers too much")
         args.fast = fast_answer = False
     if args.fast:
         print("fast:    while reading your question, words whose choice of expert is close share experts that are read "

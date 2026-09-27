@@ -25,7 +25,8 @@ def pack(first, out):
     by_layer = defaultdict(list)
     for p in parts:
         for t in gguf.GGUFReader(p).tensors:
-            if "_exps." in t.name or t.name.startswith("token_embd") or int(t.n_bytes) < (256 << 10):
+            lookup = t.name.startswith(("token_embd", "per_layer_token_embd"))  # tables read a few rows per word
+            if "_exps." in t.name or lookup or int(t.n_bytes) < (256 << 10):
                 continue
             layer = int(t.name.split(".")[1]) if t.name.startswith("blk.") else 1 << 20  # output layer etc. last
             by_layer[layer].append(t)

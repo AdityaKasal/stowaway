@@ -31,10 +31,10 @@ index d8319cd..7eb83f7 100644
      }
 diff --git a/common/moe-stream.h b/common/moe-stream.h
 new file mode 100644
-index 0000000..38c71e1
+index 0000000..b400c5a
 --- /dev/null
 +++ b/common/moe-stream.h
-@@ -0,0 +1,1949 @@
+@@ -0,0 +1,1950 @@
 +// moe-stream: run Mixture-of-Experts models that are much bigger than RAM (moe-router-study).
 +//
 +// - expert_cache: keeps recently used experts in a fixed block of RAM and reads missing ones straight from the model
@@ -543,8 +543,9 @@ index 0000000..38c71e1
 +            const size_t data = gguf_get_data_offset(g);
 +            for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
 +                const std::string name = gguf_get_tensor_name(g, i);
-+                if (name.find("_exps.") != std::string::npos || name.rfind("token_embd", 0) == 0) {
-+                    continue; // experts have their own cache; the embedding table is read one row per word
++                if (name.find("_exps.") != std::string::npos || name.rfind("token_embd", 0) == 0 ||
++                    name.rfind("per_layer_token_embd", 0) == 0) {
++                    continue; // experts have their own cache; the lookup tables are read a few rows per word
 +                }
 +                const int layer = name.rfind("blk.", 0) == 0 ? atoi(name.c_str() + 4) : -1;
 +                dense_by_layer[layer].push_back({ fi, data + gguf_get_tensor_offset(g, i), gguf_get_tensor_size(g, i), name });
