@@ -31,10 +31,10 @@ index d8319cd..7eb83f7 100644
      }
 diff --git a/common/moe-stream.h b/common/moe-stream.h
 new file mode 100644
-index 0000000..162bd15
+index 0000000..571a50c
 --- /dev/null
 +++ b/common/moe-stream.h
-@@ -0,0 +1,1974 @@
+@@ -0,0 +1,1983 @@
 +// moe-stream: run Mixture-of-Experts models that are much bigger than RAM (moe-router-study).
 +//
 +// - expert_cache: keeps recently used experts in a fixed block of RAM and reads missing ones straight from the model
@@ -1702,6 +1702,7 @@ index 0000000..162bd15
 +    float eps = 1e-6f;
 +    std::map<int, std::vector<float>> router; // layer -> [n_expert][n_embd] (ffn_gate_inp)
 +    std::map<int, std::vector<float>> norm;   // layer -> [n_embd] (post_attention_norm, the MoE input norm)
++    std::map<int, std::vector<float>> ffn_norm; // the same, as llama-style models name it (used when norm is missing)
 +    std::map<int, std::vector<int32_t>> guessed;
 +    size_t right = 0, total = 0;
 +    expert_cache * cache = nullptr;
@@ -1756,7 +1757,8 @@ index 0000000..162bd15
 +                const std::string name = gguf_get_tensor_name(g, i);
 +                const bool is_router = name.find(".ffn_gate_inp.weight") != std::string::npos;
 +                const bool is_norm   = name.find(".post_attention_norm.weight") != std::string::npos;
-+                if (!is_router && !is_norm) {
++                const bool is_ffn_norm = name.find(".ffn_norm.weight") != std::string::npos; // llama-style names
++                if (!is_router && !is_norm && !is_ffn_norm) {
 +                    continue;
 +                }
 +                if (gguf_get_tensor_type(g, i) != GGML_TYPE_F32) {
@@ -1764,7 +1766,7 @@ index 0000000..162bd15
 +                    continue;
 +                }
 +                const int layer = atoi(name.c_str() + 4);
-+                auto & dst = is_router ? router[layer] : norm[layer];
++                auto & dst = is_router ? router[layer] : is_norm ? norm[layer] : ffn_norm[layer];
 +                if (!read_f32(paths[fi], data + gguf_get_tensor_offset(g, i), gguf_get_tensor_size(g, i) / sizeof(float), dst)) {
 +                    return false;
 +                }
@@ -1775,11 +1777,18 @@ index 0000000..162bd15
 +        // layer's experts from this layer's MoE input as it is (neighbouring layers' inputs are close)
 +        size_t no_norm = 0;
 +        for (const auto & kv : router) {
-+            if (!norm.count(kv.first)) {
++            if (norm.count(kv.first)) {
++                continue;
++            }
++            auto f = ffn_norm.find(kv.first); // llama-style models call the norm before the MoE ffn_norm
++            if (f != ffn_norm.end()) {
++                norm[kv.first] = f->second;
++            } else {
 +                norm[kv.first].assign(n_embd, 1.0f);
 +                no_norm++;
 +            }
 +        }
++        ffn_norm.clear();
 +        if (no_norm) {
 +            fprintf(stderr, "pre-gating: %zu layers have no pre-MoE norm weight; guessing from the layer's own input\n", no_norm);
 +        }
@@ -1996,7 +2005,7 @@ index 0000000..162bd15
 +    }
 +    const char * m = getenv("MOE_PREGATE");
 +    if (m && atoi(m) > 0 && pg.load(model_path)) {
-+        pg.m     = atoi(m);
++        pg.m     = std::min(atoi(m), pg.n_expert); // a small model can have fewer experts than guesses
 +        if (const char * d = getenv("MOE_PREGATE_DEPTH")) {
 +            pg.depth = std::max(1, atoi(d)); // guess this many layers ahead (default 1)
 +        }
