@@ -87,7 +87,17 @@ def test_small_machine_plan_streams_and_keeps_a_margin():
     plan, err = moe.make_plan(info, 1.5, 3.0)
     assert err and "not enough free RAM" in err
     plan, err = moe.make_plan(info, 7.3, 3.0)
-    assert not err and not plan["small"] and plan["dense_stream_gb"] == 0
+    assert not err and not plan["small"] and plan["dense_stream_gb"] == 0 and plan["pregate"] == 6
+
+
+def test_qwen38_preloads_guesses_only_with_a_deep_cache():
+    """Qwen3.8's pre-gating pays only when the cache holds a few words' experts (RESULTS.md 30)."""
+    info = {"arch": "qwen4exp", "dense_gb": 4.68, "dense_managed_gb": 4.6, "layers": 48, "expert_gb": 59.5,
+            "active_expert_gb": 1.16}
+    plan, err = moe.make_plan(info, 7.4, 3.0)  # 8 GB: ~0.8 GB cache
+    assert not err and plan["dense_stream_gb"] == 0 and plan["pregate"] == 0
+    plan, err = moe.make_plan(info, 15.5, 3.0)  # 16 GB: ~9 GB cache
+    assert not err and plan["pregate"] == 10
 
 
 def test_parse_header_roundtrip():

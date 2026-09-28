@@ -19,6 +19,7 @@ import ctypes
 import os
 import platform
 import random
+import shlex
 import shutil
 import subprocess
 import sys
@@ -32,7 +33,7 @@ if not FROZEN:
     sys.path.insert(0, str(HERE / "llama.cpp" / "gguf-py"))
 import gguf  # noqa: E402
 
-VERSION = "0.2.19"
+VERSION = "0.2.20"
 REPO = "AdityaKasal/stowaway"
 
 import pack_dense  # noqa: E402
@@ -128,6 +129,10 @@ def split_parts(first):
 # only the rows a word needs are read, so they cost neither RAM nor a full read per word.
 LOOKUP_TABLES = ("token_embd", "per_layer_token_embd")
 SWAP_SENSITIVE = {"gpt-oss": "gpt-oss", "qwen4exp": "Qwen3.8"}  # architectures --fast is turned off for
+# how many predicted experts to preload per layer when the always-needed weights are in RAM, and the smallest cache
+# (in words' worth of experts) where that pays. 6 always was best on the 122B. Qwen3.8 (10 experts a word) gains with a
+# deep cache (12 GB 3.3 -> 3.7, 16 GB 3.8 -> 4.3) and nothing with 8-9 GB, where the cache is ~1 word (RESULTS.md 30)
+PREGATE = {"qwen4exp": (10, 2.0)}
 
 
 def model_info(first):
@@ -187,7 +192,8 @@ def make_plan(info, ram_gb, drive, draft_gb=0.0):
     if in_ram_cache >= k["min_cache"] and (k is BIG or in_ram_cache >= k["slack"]):
         plan["dense_stream_gb"] = 0
         plan["cache_gb"] = min(in_ram_cache, info["expert_gb"])
-        plan["pregate"] = 6
+        guesses, min_words = PREGATE.get(info.get("arch"), (6, 0.0))
+        plan["pregate"] = guesses if plan["cache_gb"] >= min_words * info["active_expert_gb"] else 0
         streamed_dense = 0
     else:
         # they don't fit: stream them too, with a small expert cache (what worked for the 122B on 8 GB)
@@ -592,7 +598,7 @@ MEASURED = {
     "qwen3.5-122b": {"ram": [(3.3, 0.0), (5.2, 0.5), (7.3, 0.7), (15.5, 1.7)], "sata": 0.20},
     "qwen3.5-122b-4bit": {"ram": [(3.3, 0.0), (7.3, 1.0), (15.5, 3.4)], "sata": 0.20},  # RESULTS.md 28
     # mostly computing, so a faster drive barely helps: 16 GB, 3.9-4.0 at 3 GB/s vs 3.8-3.9 at 4.9 GB/s (RESULTS.md 29)
-    "qwen3.8-next": {"ram": [(4.0, 0.0), (5.3, 0.4), (7.4, 2.6), (8.5, 3.25), (15.5, 3.95)], "sata": 0.20,
+    "qwen3.8-next": {"ram": [(4.0, 0.0), (5.3, 0.4), (7.4, 2.6), (8.5, 3.25), (11.4, 3.7), (15.5, 4.1)], "sata": 0.20,
                      "fast_drive": 1.0},
 }
 # best first. Qwen3.8 is 4-bit but far ahead of the rest in its makers' tests; otherwise a lossy quant ranks below an exact
@@ -906,6 +912,9 @@ def run(args):
                MOE_CACHE_GB=f"{plan['cache_gb']:.2f}", MOE_IO_THREADS="4", MOE_PREGATE=str(plan["pregate"]),
                EXPERT_CACHE_PACKED=str(packed), EXPERT_CACHE_CHUNK_KB="8192", LLAMA_NO_MMAP_PREFETCH="1",
                CUDA_VISIBLE_DEVICES=os.environ.get("CUDA_VISIBLE_DEVICES", "-1"))
+    for k in ("MOE_CACHE_GB", "MOE_IO_THREADS", "MOE_PREGATE"):
+        if k in os.environ:
+            env[k] = os.environ[k]  # set by hand (experiments): that value wins over the plan
     if args.fast:
         env["MOE_BATCH_BONUS"] = "1.0"  # batch-aware routing while reading the question: -31% reads, KLD 0.016 (RESULTS.md 20)
         if fast_answer:
@@ -928,6 +937,7 @@ def run(args):
     if fewer:
         common += ["--override-kv", f"{info['arch']}.expert_used_count=int:{args.experts}"]
         env["MOE_EXPERTS_USED"] = str(args.experts)
+    common += shlex.split(os.environ.get("STOWAWAY_LLAMA_ARGS", ""))  # extra llama.cpp flags, for experiments
 
     if args.prompt or args.cli:
         cmd = [str(find_bin("llama-cli", args.bin))] + common

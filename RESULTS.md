@@ -813,8 +813,71 @@ each expert is evicted just before the next word could reuse it. Giving each lay
 the speed (2.4-2.5 either way); at 9 GB it was slower (3.1 -> 2.7-2.8). With the compute share this large, fewer reads
 barely show.
 
+**Its MTP head (guess the next words, check them in one pass).** Qwen3.8 ships a one-layer draft head; the pull
+request that runs it (ggml-org/llama.cpp#28243, not merged yet) applied cleanly on our tree, and the shared-Q8_0 head
+(2.6 GB) loads next to our cache. 16 GB VM, 4 threads (`vm/q38-mtp.sh`, `vm/q38-mtp-diag.sh`):
+
+| Setting | Guesses accepted | Words per check | words/s |
+|---|---|---|---|
+| no MTP | | 1 | 3.6-3.8 |
+| 2 guesses, the model's sampling | 41% | 1.82 | 2.3 |
+| 2 guesses, greedy | 53% | 2.06 | 2.5 |
+| 1 guess, greedy | 77% | 1.77 | 3.1 |
+
+Checking 3 words takes ~0.82 s and 2 words ~0.57 s against 0.27 s for one: every extra word in the check costs about
+a whole word, so there is nothing to amortize. That also shows the ~0.19 s per word is work done per word (not reading
+the always-needed weights, which a batch would share). With 8 GB, making room for the head pushed the plan into
+streaming (2.4 -> 1.1-1.7). MTP stays out of the app.
+
 The app: `qwen3.8-next` heads the catalog and the quality ranking (recommended from ~9 GB free up); the two
 Qwen3.5-122B entries are shown only if already downloaded, since Qwen3.8 is both stronger and faster everywhere.
+
+## 30. Where Qwen3.8's time goes, and pre-gating that was switched off (2026-09-27)
+
+More threads help but not in proportion (16 GB VM, `vm/q38-threads.sh`): 2/3/4 threads on 4 CPUs 2.7/3.3/3.8 words/s,
+4/6/8 threads on 8 CPUs 3.7/4.3/4.4. About 0.16 s a word doesn't shrink with threads.
+
+To see what that is, ggml-cpu got an opt-in per-op timer (`GGML_CPU_PROFILE=1`: thread 0 times each graph node up to
+the barrier after it, plus the time it spends in our expert hook while the other threads wait; printed at exit).
+16 GB, 4 threads, a 200-word answer, ~295 ms a word (`vm/q38-opprof.sh`):
+
+| Part | ms a word | Share |
+|---|---|---|
+| waiting for expert reads (inside the hook) | ~82 | 28% |
+| the hook's own work (lookups, prediction) | ~18 | 6% |
+| always-needed weights (`MUL_MAT`, ~40 GB/s from RAM) | ~111 | 38% |
+| expert math (`MUL_MAT_ID` minus the hook) | ~56 | 19% |
+| everything else (n-gram lookups, DeltaNet, norms, hyper-connections) | ~28 | 9% |
+
+The waiting was the surprise: with a 9 GB cache only ~0.3 GB a word comes from disk, but each layer's one or two
+misses cost a read's full latency (~2 ms), 48 times a word. Pre-gating (guessing the next layer's experts from this
+layer and loading them early) exists for exactly this, and it turned out to be off for Qwen3.8: it looks for each
+layer's `post_attention_norm`, which this model doesn't have (its MoE input comes out of the hyper-connection mix).
+Now a layer without that norm guesses from its own MoE input as it is, and the guess loop sums in 8 lanes so it
+vectorizes. Same answer (greedy, identical text) with different numbers of guesses (`vm/q38-pregate.sh`):
+
+| 16 GB | words/s | waiting | guesses right |
+|---|---|---|---|
+| pre-gating off (v0.2.19) | 3.8 | 5.3 s | |
+| 6 guesses per layer | 4.0 | 3.2 s | 70% |
+| 10 | 4.3 | 2.5 s | 59% |
+| 16 | 4.2 | 2.5 s | 43% |
+| 10, two layers ahead | 3.5 | 2.2 s | 49% |
+
+It depends on how deep the cache is (same comparison, off vs 10 guesses):
+
+| Memory | Cache | off | 10 guesses |
+|---|---|---|---|
+| 8 GB | 0.8 GB (~0.7 words' experts) | 2.4 | 2.3 |
+| 9 GB | 1.7 GB (~1.5 words) | 2.9 | 2.9 |
+| 12 GB | ~4.7 GB (~4 words) | 3.3 | 3.7 |
+| 16 GB | ~9 GB (~8 words) | 3.8 | 4.3 |
+
+With a shallow cache nothing changes: it is all recent experts, which guesses may not replace (tens of thousands of
+guesses skipped), and with 8 GB the drive is the limit anyway. The app preloads 10 guesses for Qwen3.8 when the cache
+holds at least 2 words' experts, and otherwise leaves it off as before; other models keep 6. With the model's own
+sampling (different text each run, so noisier) the release build gave 2.2-2.3 at 8 GB, 2.7 at 9 GB and 4.0-4.1 at
+16 GB. The other catalog models have the norm, so their pre-gating is unchanged.
 
 ## What didn't work, and why
 - Storing Qwen3.8's always-needed weights in fewer bits (Q5_1, Q4_1, or Unsloth's calibrated Q5_K/Q6_K): KLD 0.06-0.23

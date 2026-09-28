@@ -31,10 +31,10 @@ index d8319cd..7eb83f7 100644
      }
 diff --git a/common/moe-stream.h b/common/moe-stream.h
 new file mode 100644
-index 0000000..b400c5a
+index 0000000..162bd15
 --- /dev/null
 +++ b/common/moe-stream.h
-@@ -0,0 +1,1950 @@
+@@ -0,0 +1,1974 @@
 +// moe-stream: run Mixture-of-Experts models that are much bigger than RAM (moe-router-study).
 +//
 +// - expert_cache: keeps recently used experts in a fixed block of RAM and reads missing ones straight from the model
@@ -1771,6 +1771,18 @@ index 0000000..b400c5a
 +            }
 +            gguf_free(g);
 +        }
++        // no pre-MoE norm weight (Qwen3.8: the MoE input comes out of the hyper-connection mix): guess the next
++        // layer's experts from this layer's MoE input as it is (neighbouring layers' inputs are close)
++        size_t no_norm = 0;
++        for (const auto & kv : router) {
++            if (!norm.count(kv.first)) {
++                norm[kv.first].assign(n_embd, 1.0f);
++                no_norm++;
++            }
++        }
++        if (no_norm) {
++            fprintf(stderr, "pre-gating: %zu layers have no pre-MoE norm weight; guessing from the layer's own input\n", no_norm);
++        }
 +        x.resize(n_embd);
 +        u.resize(n_embd);
 +        logits.resize(n_expert);
@@ -1910,12 +1922,21 @@ index 0000000..b400c5a
 +        }
 +        const float * W = r->second.data();
 +        for (int e = 0; e < n_expert; e++) {
-+            float acc = 0;
++            // 8 independent sums, so the compiler can vectorize (one running sum can't be reordered): this runs on
++            // the compute thread for every layer, while the other threads wait
++            float acc[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 +            const float * w = W + (size_t) e * n_embd;
-+            for (int j = 0; j < n_embd; j++) {
-+                acc += w[j] * x[j];
++            int j = 0;
++            for (; j + 8 <= n_embd; j += 8) {
++                for (int q = 0; q < 8; q++) {
++                    acc[q] += w[j + q] * x[j + q];
++                }
 +            }
-+            logits[e] = acc;
++            float sum = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
++            for (; j < n_embd; j++) {
++                sum += w[j] * x[j];
++            }
++            logits[e] = sum;
 +            order[e] = e;
 +        }
 +        return true;
@@ -1976,6 +1997,9 @@ index 0000000..b400c5a
 +    const char * m = getenv("MOE_PREGATE");
 +    if (m && atoi(m) > 0 && pg.load(model_path)) {
 +        pg.m     = atoi(m);
++        if (const char * d = getenv("MOE_PREGATE_DEPTH")) {
++            pg.depth = std::max(1, atoi(d)); // guess this many layers ahead (default 1)
++        }
 +        if (const char * k = getenv("MOE_EXPERTS_USED")) {
 +            pg.k_used = atoi(k); // the model was told to use fewer experts per token (--override-kv)
 +        }
@@ -2012,14 +2036,66 @@ index dc6453c..60d374b 100644
  }
  #endif
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 8bb0ff7..22ca417 100644
+index 8bb0ff7..d61cdb9 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -1469,6 +1469,24 @@ UseGgmlGemm2:;
+@@ -1469,6 +1469,76 @@ UseGgmlGemm2:;
  
  // ggml_compute_forward_mul_mat_id
  
 +// moe-router-study expert hook (see ggml-cpu.h). One op runs at a time, so a single table is enough.
++// GGML_CPU_PROFILE=1: wall time per op type (thread 0: from the op's start to the barrier after it), printed at exit.
++// Also the time thread 0 spends in the expert hook, while the other threads wait at the barrier after it.
++static inline uint64_t ggml_time_ns(void) {
++#ifdef _WIN32
++    return (uint64_t) ggml_time_us() * 1000;
++#else
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
++#endif
++}
++static int      g_prof = -1;
++static uint64_t g_prof_ns[GGML_OP_COUNT];
++static uint64_t g_prof_n[GGML_OP_COUNT];
++static uint64_t g_prof_hook_ns, g_prof_graphs, g_prof_graph_ns;
++static void ggml_cpu_prof_report(void) {
++    uint64_t total = 0;
++    for (int i = 0; i < GGML_OP_COUNT; i++) {
++        total += g_prof_ns[i];
++    }
++    if (!total) {
++        return;
++    }
++    fprintf(stderr, "cpu-profile: %llu graphs, %.1f ms each; per op type (total ms, share, count, avg us):\n",
++            (unsigned long long) g_prof_graphs, g_prof_graph_ns / 1e6 / (g_prof_graphs ? g_prof_graphs : 1));
++    for (int k = 0; k < 20; k++) {
++        int best = -1;
++        for (int i = 0; i < GGML_OP_COUNT; i++) {
++            if (g_prof_ns[i] && (best < 0 || g_prof_ns[i] > g_prof_ns[best])) {
++                best = i;
++            }
++        }
++        if (best < 0) {
++            break;
++        }
++        fprintf(stderr, "cpu-profile:   %-22s %9.0f %5.1f%% %9llu %8.1f\n", ggml_op_name((enum ggml_op) best),
++                g_prof_ns[best] / 1e6, 100.0 * g_prof_ns[best] / total, (unsigned long long) g_prof_n[best],
++                g_prof_ns[best] / 1e3 / g_prof_n[best]);
++        g_prof_ns[best] = 0;
++    }
++    fprintf(stderr, "cpu-profile: expert hook on thread 0: %.0f ms\n", g_prof_hook_ns / 1e6);
++}
++static inline bool ggml_cpu_prof_on(void) {
++    if (g_prof < 0) {
++        g_prof = getenv("GGML_CPU_PROFILE") != NULL;
++        if (g_prof) {
++            atexit(ggml_cpu_prof_report);
++        }
++    }
++    return g_prof;
++}
++
 +static ggml_cpu_expert_hook_t g_expert_hook      = NULL;
 +static void *                 g_expert_hook_data = NULL;
 +static const void *           g_expert_ptrs[1024];
@@ -2040,7 +2116,7 @@ index 8bb0ff7..22ca417 100644
  #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
  
  struct mmid_row_mapping {
-@@ -1598,7 +1616,8 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1598,7 +1668,8 @@ static void ggml_compute_forward_mul_mat_id(
  
      // IQ panel gemm (see iqp.h); per expert eligibility is decided below, but the work buffer is
      // reserved for the whole node (ggml_graph_plan sizes it without params, use_ref only skips the dispatch)
@@ -2050,7 +2126,7 @@ index 8bb0ff7..22ca417 100644
  
      char * iqp_panels = NULL;
  
-@@ -1660,6 +1679,22 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1660,6 +1731,26 @@ static void ggml_compute_forward_mul_mat_id(
                  matrix_row_counts[i02] += 1;
              }
          }
@@ -2065,7 +2141,11 @@ index 8bb0ff7..22ca417 100644
 +                }
 +            }
 +            const void * ptrs[1024];
++            const uint64_t th0 = g_prof > 0 ? ggml_time_ns() : 0;
 +            g_expert_hook(src0, src1, used, n_used, ptrs, g_expert_hook_data);
++            if (g_prof > 0) {
++                g_prof_hook_ns += ggml_time_ns() - th0;
++            }
 +            for (int j = 0; j < n_used; ++j) {
 +                g_expert_ptrs[used[j]] = ptrs[j];
 +            }
@@ -2073,7 +2153,7 @@ index 8bb0ff7..22ca417 100644
      }
  
      // reset current_chunk
-@@ -1684,7 +1719,8 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1684,7 +1775,8 @@ static void ggml_compute_forward_mul_mat_id(
              continue;
          }
  
@@ -2083,7 +2163,7 @@ index 8bb0ff7..22ca417 100644
          const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
          const size_t row_size = ggml_row_size(vec_dot_type, ne10);
  
-@@ -1868,7 +1904,17 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+@@ -1868,7 +1960,17 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
              } break;
          case GGML_OP_MUL_MAT:
              {
@@ -2102,6 +2182,33 @@ index 8bb0ff7..22ca417 100644
              } break;
          case GGML_OP_MUL_MAT_ID:
              {
+@@ -3134,8 +3236,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
+ #endif
+ 
++    const bool prof = state->ith == 0 && ggml_cpu_prof_on();
++    const uint64_t tg0 = prof ? ggml_time_ns() : 0;
+     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
+         struct ggml_tensor * node = cgraph->nodes[node_n];
++        const uint64_t tn0 = prof ? ggml_time_ns() : 0;
+ 
+         if (ggml_op_is_empty(node->op)) {
+             // skip NOPs
+@@ -3164,6 +3269,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+         if (node_n + 1 < cgraph->n_nodes) {
+             ggml_barrier(state->threadpool);
+         }
++        if (prof) {
++            g_prof_ns[node->op] += ggml_time_ns() - tn0;
++            g_prof_n[node->op]++;
++        }
++    }
++    if (prof) {
++        g_prof_graphs++;
++        g_prof_graph_ns += ggml_time_ns() - tg0;
+     }
+ 
+ #ifdef GGML_USE_OPENMP
 diff --git a/include/llama.h b/include/llama.h
 index 31bbf8b..91bd2da 100644
 --- a/include/llama.h
